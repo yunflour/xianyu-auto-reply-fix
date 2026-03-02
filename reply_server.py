@@ -5925,6 +5925,7 @@ class AIReplySettings(BaseModel):
     model_name: str = "qwen-plus"
     api_key: str = ""
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_type: str = ""
     max_discount_percent: int = 10
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
@@ -5936,6 +5937,7 @@ class AIConfigPreset(BaseModel):
     model_name: str
     api_key: str = ""
     base_url: str = ""
+    api_type: str = ""
 
 
 @app.delete("/items/batch")
@@ -6075,7 +6077,8 @@ def save_ai_config_preset(
             preset_name=preset.preset_name,
             model_name=preset.model_name,
             api_key=preset.api_key,
-            base_url=preset.base_url
+            base_url=preset.base_url,
+            api_type=preset.api_type
         )
         return {"message": "预设保存成功", "preset_id": preset_id}
     except HTTPException:
