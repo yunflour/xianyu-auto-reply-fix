@@ -445,6 +445,30 @@ class OrderDetailFetcher:
                         logger.warning(f"获取页面标题失败: {e}")
                         title = f"订单详情 - {order_id}"
 
+                    # 数量校验：如果数量>10，刷新页面重新确认
+                    if sku_info and 'quantity' in sku_info:
+                        try:
+                            quantity_int = int(sku_info['quantity'])
+                            if quantity_int > 10:
+                                logger.warning(f"解析到异常数量 {quantity_int}，刷新页面重新确认...")
+                                await asyncio.sleep(0.5)
+                                await self.page.reload(wait_until='networkidle', timeout=15000)
+                                await asyncio.sleep(1)
+
+                                # 重新获取SKU内容进行校验
+                                retry_sku_info = await self._get_sku_content()
+                                if retry_sku_info and 'quantity' in retry_sku_info:
+                                    retry_quantity = int(retry_sku_info['quantity'])
+                                    if retry_quantity == quantity_int:
+                                        logger.info(f"二次确认数量一致: {quantity_int}，确认为多数量订单")
+                                    else:
+                                        # 两次不一致，使用较小的值
+                                        final_qty = min(quantity_int, retry_quantity)
+                                        logger.warning(f"数量校验不一致: 第一次={quantity_int}, 第二次={retry_quantity}，使用较小值: {final_qty}")
+                                        sku_info['quantity'] = str(final_qty)
+                        except Exception as verify_e:
+                            logger.warning(f"数量校验失败，使用原始值: {verify_e}")
+
                     result = {
                         'order_id': order_id,
                         'url': url,
@@ -1577,14 +1601,17 @@ class OrderDetailFetcher:
 
         # 数量提取
         quantity_patterns = [
-            r'数量\s*[:：]?\s*x?\s*(\d+)',
-            r'\bx\s*(\d{1,3})\b',
+            r'数量\s*[:：]?\s*x?\s*([1-9]\d*)',  # 必须以非零数字开头，避免匹配到订单号等
+            r'\bx\s*([1-9]\d{0,2})\b',  # x后面跟非零开头的数字（1-3位）
         ]
         for pattern in quantity_patterns:
             quantity_match = re.search(pattern, text, re.IGNORECASE)
             if quantity_match:
-                result['quantity'] = quantity_match.group(1)
-                break
+                qty = quantity_match.group(1)
+                # 额外校验：数量不应该以0开头
+                if not qty.startswith('0'):
+                    result['quantity'] = qty
+                    break
 
         # 规格提取：过滤明显非规格行
         spec_candidates = []

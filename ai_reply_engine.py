@@ -10,9 +10,10 @@ AI回复引擎模块 - 统一意图识别与回复生成
 
 import json
 import time
+import base64
 import requests
 import threading
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from loguru import logger
 from db_manager import db_manager
 
@@ -68,8 +69,38 @@ class AIReplyEngine:
         """判断是否为Gemini API"""
         model_name = settings.get('model_name', '').lower()
         return 'gemini' in model_name
+
+    def _download_image_as_base64(self, image_url: str) -> Optional[Dict]:
+        """下载图片并转为base64，返回 {mime_type, data} 或 None"""
+        try:
+            resp = requests.get(image_url, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"下载图片失败: {resp.status_code} - {image_url}")
+                return None
+            content_type = resp.headers.get('Content-Type', 'image/jpeg')
+            # 只保留 mime type 主体部分
+            mime_type = content_type.split(';')[0].strip()
+            if not mime_type.startswith('image/'):
+                mime_type = 'image/jpeg'
+            img_b64 = base64.b64encode(resp.content).decode('utf-8')
+            return {"mime_type": mime_type, "data": img_b64}
+        except Exception as e:
+            logger.error(f"下载图片转base64失败: {e}")
+            return None
+
+    def _extract_text_from_content(self, content) -> str:
+        """从 content（str 或 list）中提取纯文本部分"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                if isinstance(part, dict) and part.get('type') == 'text':
+                    texts.append(part.get('text', ''))
+            return "\n".join(texts)
+        return str(content)
     
-    def _build_unified_system_prompt(self, custom_prompts: dict, settings: dict) -> str:
+    def _build_unified_system_prompt(self, custom_prompts: dict, settings: dict, has_image: bool = False) -> str:
         """
         构建统一的系统提示词
         将意图判断和回复生成整合到一个提示词中
@@ -84,6 +115,12 @@ class AIReplyEngine:
         max_discount_percent = settings.get('max_discount_percent', 10)
         max_discount_amount = settings.get('max_discount_amount', 100)
         
+        # 根据是否有图片动态生成提示
+        if has_image:
+            image_hint = "用户发送了一张图片，请结合图片内容和商品信息进行回复。如果图片与商品无关，可以简单回应。"
+        else:
+            image_hint = '如果用户的问题超过你的回答范围，比如发图片，可以说"等等，这个问题我需要看看"，不要自己回答'
+
         unified_prompt = f"""你是一位专业的电商客服AI助手。请根据用户消息和上下文，直接生成合适的回复。
 
 ## 核心原则
@@ -108,7 +145,7 @@ class AIReplyEngine:
 ## 特别注意
 - 用户只是问价格≠用户在砍价，正常回答价格即可
 - 用户咨询售后≠用户要退款，正常解答即可
-- 如果用户的问题超过你的回答范围，比如发图片，可以说"等等，这个问题我需要看看"，不要自己回答
+- {image_hint}
 
 请直接输出回复内容，不要输出分析过程。"""
         
@@ -130,7 +167,8 @@ class AIReplyEngine:
             if msg['role'] == 'system':
                 system_content = msg['content']
             elif msg['role'] == 'user':
-                user_content = msg['content'] # 假设 user prompt 已在 generate_reply 中构建好
+                # 兼容多模态content：提取纯文本部分（DashScope应用API不支持图片）
+                user_content = self._extract_text_from_content(msg['content'])
 
         if system_content and user_content:
             prompt = f"{system_content}\n\n用户问题：{user_content}\n\n请直接回答用户的问题："
@@ -180,21 +218,36 @@ class AIReplyEngine:
 
         # --- 转换消息格式 (修复 P1-3: 增强健壮性) ---
         system_instruction = ""
-        user_content_parts = []
+        gemini_parts = []
 
         # 遍历消息，找到 system 和所有的 user parts
         for msg in messages:
             if msg['role'] == 'system':
                 system_instruction = msg['content']
             elif msg['role'] == 'user':
-                # 我们只关心 user content
-                user_content_parts.append(msg['content'])
-        
-        # 将所有 user parts 合并为最后的 user_content
-        # 在我们的使用场景中 (generate_reply)，只会有一个 user part，但这样更安全
-        user_content = "\n".join(user_content_parts)
+                content = msg['content']
+                if isinstance(content, list):
+                    # 多模态内容：逐项转换为 Gemini parts 格式
+                    for part in content:
+                        if part.get('type') == 'text':
+                            gemini_parts.append({"text": part['text']})
+                        elif part.get('type') == 'image_url':
+                            img_url = part.get('image_url', {}).get('url', '')
+                            if img_url:
+                                img_data = self._download_image_as_base64(img_url)
+                                if img_data:
+                                    gemini_parts.append({
+                                        "inlineData": {
+                                            "mimeType": img_data['mime_type'],
+                                            "data": img_data['data']
+                                        }
+                                    })
+                                else:
+                                    gemini_parts.append({"text": "[用户发送了一张图片，但图片加载失败]"})
+                else:
+                    gemini_parts.append({"text": str(content)})
 
-        if not user_content:
+        if not gemini_parts:
             logger.warning(f"Gemini API 调用: 未在消息中找到 'user' 角色内容。Messages: {messages}")
             raise ValueError("未在消息中找到用户内容 (user content)")
         # --- 消息格式转换结束 ---
@@ -203,7 +256,7 @@ class AIReplyEngine:
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": user_content}]
+                    "parts": gemini_parts
                 }
             ],
             "generationConfig": {
@@ -323,7 +376,31 @@ class AIReplyEngine:
             if msg['role'] == 'system':
                 system_content = msg['content']
             else:
-                api_messages.append({"role": msg['role'], "content": msg['content']})
+                content = msg['content']
+                if isinstance(content, list):
+                    # 多模态内容：转换为 Anthropic 格式
+                    anthropic_content = []
+                    for part in content:
+                        if part.get('type') == 'text':
+                            anthropic_content.append({"type": "text", "text": part['text']})
+                        elif part.get('type') == 'image_url':
+                            img_url = part.get('image_url', {}).get('url', '')
+                            if img_url:
+                                img_data = self._download_image_as_base64(img_url)
+                                if img_data:
+                                    anthropic_content.append({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": img_data['mime_type'],
+                                            "data": img_data['data']
+                                        }
+                                    })
+                                else:
+                                    anthropic_content.append({"type": "text", "text": "[用户发送了一张图片，但图片加载失败]"})
+                    api_messages.append({"role": msg['role'], "content": anthropic_content})
+                else:
+                    api_messages.append({"role": msg['role'], "content": content})
 
         data = {
             "model": settings['model_name'],
@@ -392,10 +469,11 @@ class AIReplyEngine:
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str,
-                      skip_wait: bool = False) -> Optional[str]:
+                      skip_wait: bool = False, image_url: str = None) -> Optional[str]:
         """
         生成AI回复 - 统一意图识别与回复生成
         AI会自动判断用户意图并生成合适的回复，避免关键词误判
+        支持图片识别：当 image_url 不为空且启用 vision_enabled 时，构建多模态请求
         """
         if not self.is_ai_enabled(cookie_id):
             return None
@@ -441,7 +519,15 @@ class AIReplyEngine:
                 max_discount_amount = settings.get('max_discount_amount', 100)
 
                 # 4. 构建统一的系统提示词（整合意图判断和回复生成）
-                system_prompt = self._build_unified_system_prompt(custom_prompts, settings)
+                # 判断是否启用识图
+                vision_enabled = settings.get('vision_enabled', False)
+                has_image = bool(image_url) and vision_enabled
+                if image_url and not vision_enabled:
+                    logger.info(f"【{cookie_id}】收到图片消息但未启用识图功能，忽略图片")
+                elif has_image:
+                    logger.info(f"【{cookie_id}】识图模式：将图片发送给AI分析: {image_url[:80]}...")
+
+                system_prompt = self._build_unified_system_prompt(custom_prompts, settings, has_image=has_image)
 
                 # 5. 构建商品信息
                 item_desc = f"商品标题: {item_info.get('title', '未知')}\n"
@@ -473,10 +559,18 @@ class AIReplyEngine:
 
 请根据以上信息，直接回复用户："""
 
-                # 8. 构建消息列表
+                # 8. 构建消息列表（支持多模态图片）
+                if has_image:
+                    user_content = [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                else:
+                    user_content = user_prompt
+
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_content}
                 ]
 
                 # 9. 根据API类型调用对应的AI接口
@@ -521,14 +615,14 @@ class AIReplyEngine:
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
                                    cookie_id: str, user_id: str, item_id: str,
-                                   skip_wait: bool = False) -> Optional[str]:
+                                   skip_wait: bool = False, image_url: str = None) -> Optional[str]:
         """
         异步包装器：在独立线程池中执行同步的 `generate_reply`，并返回结果。
         这样可以在异步代码中直接 await，而不阻塞事件循环。
         """
         try:
             import asyncio as _asyncio
-            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
+            return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait, image_url)
         except Exception as e:
             logger.error(f"异步生成回复失败: {e}")
             return None

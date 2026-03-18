@@ -3665,6 +3665,71 @@ class XianyuLive:
                     successful_send_count = 0
                     last_delivery_error = None
 
+                    # 收集所有发货内容，用于合并发送
+                    # 当购买多个卡券且都是纯文本类型时，合并成一条消息发送
+                    collected_text_contents = []  # 存储 {'content': str, 'rule_meta': dict, 'unit_index': int} 字典
+
+                    async def _flush_collected_texts():
+                        """合并发送已收集的纯文本内容并进行收尾处理，发送后清空列表"""
+                        nonlocal successful_send_count, last_delivery_error
+                        if not collected_text_contents:
+                            return
+                        items_to_flush = list(collected_text_contents)
+                        collected_text_contents.clear()
+                        try:
+                            merged = '\n'.join(item['content'] for item in items_to_flush)
+                            first_meta = items_to_flush[0]['rule_meta']
+                            steps = self._build_delivery_steps(merged, first_meta.get('card_description', ''))
+                            await self._send_delivery_steps(
+                                websocket, chat_id, send_user_id, steps,
+                                user_url=user_url,
+                                log_prefix=f'[{msg_time}] 多数量自动发货合并发送 ({len(items_to_flush)}个)'
+                            )
+                            for flush_item in items_to_flush:
+                                flush_meta = flush_item['rule_meta']
+                                fin = await self._finalize_delivery_after_send(
+                                    delivery_meta=flush_meta, order_id=order_id, item_id=item_id
+                                )
+                                if fin.get('success'):
+                                    self._persist_delivery_finalization_state(
+                                        order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                        delivery_meta=flush_meta, channel='auto', status='finalized'
+                                    )
+                                    successful_send_count += 1
+                                else:
+                                    err = fin.get('error') or '收尾失败'
+                                    self._persist_delivery_finalization_state(
+                                        order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                        delivery_meta=flush_meta, channel='auto', status='sent', last_error=err
+                                    )
+                                    self._record_delivery_log(
+                                        order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                        buyer_nick=send_user_name, status='failed', reason=err,
+                                        channel='auto', rule_meta=flush_meta
+                                    )
+                            self._record_delivery_log(
+                                order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                buyer_nick=send_user_name, status='success',
+                                reason=f'多数量自动发货合并发送成功，共 {len(items_to_flush)} 个卡券',
+                                channel='auto', rule_meta=first_meta
+                            )
+                        except Exception as e:
+                            flush_error = f"多数量合并发送失败: {self._safe_str(e)}"
+                            logger.error(flush_error)
+                            last_delivery_error = flush_error
+                            for flush_item in items_to_flush:
+                                self._release_data_reservation_if_needed(flush_item['rule_meta'], error=flush_error)
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    delivery_meta=flush_item['rule_meta'], channel='auto',
+                                    status='sent', last_error=flush_error
+                                )
+                                self._record_delivery_log(
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    buyer_nick=send_user_name, status='failed', reason=flush_error,
+                                    channel='auto', rule_meta=flush_item['rule_meta']
+                                )
+
                     for i in range(quantity_to_send):
                         rule_meta = {}
                         try:
@@ -3753,7 +3818,8 @@ class XianyuLive:
                                     'data_line': delivery_result.get('data_line'),
                                     'data_reservation_id': delivery_result.get('data_reservation_id'),
                                     'data_reservation_status': delivery_result.get('data_reservation_status'),
-                                    'delivery_unit_index': delivery_result.get('delivery_unit_index')
+                                    'delivery_unit_index': delivery_result.get('delivery_unit_index'),
+                                    'raw_delivery_content': delivery_result.get('raw_delivery_content') or delivery_content
                                 }
                             else:
                                 delivery_content = delivery_result
@@ -3779,98 +3845,88 @@ class XianyuLive:
                             if not delivery_steps:
                                 delivery_steps = self._build_delivery_steps(delivery_content, rule_meta.get('card_description', ''))
 
-                            await self._send_delivery_steps(
-                                websocket,
-                                chat_id,
-                                send_user_id,
-                                delivery_steps,
-                                user_url=user_url,
-                                log_prefix=f'[{msg_time}] 多数量自动发货 {i+1}/{quantity_to_send}'
-                            )
+                            # 判断是否为纯文本类型（可合并发送）
+                            is_text_only = all(step.get('type') == 'text' for step in delivery_steps)
 
-                            if not self._mark_data_reservation_sent_if_needed(rule_meta):
-                                self._release_data_reservation_if_needed(rule_meta, error='发送成功后标记预占已发送失败')
-                                raise Exception('批量数据预占标记已发送失败')
-
-                            self._persist_delivery_finalization_state(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=send_user_id,
-                                delivery_meta=rule_meta,
-                                channel='auto',
-                                status='sent'
-                            )
-
-                            finalize_result = await self._finalize_delivery_after_send(
-                                delivery_meta=rule_meta,
-                                order_id=order_id,
-                                item_id=item_id
-                            )
-                            if not finalize_result.get('success'):
-                                last_delivery_error = finalize_result.get('error') or f"第 {i+1} 条消息发送成功但提交发货副作用失败"
+                            if is_text_only and quantity_to_send > 1:
+                                # 多数量发货时，收集原始发货内容（未应用模板），稍后合并发送
+                                collected_text_contents.append({
+                                    'content': rule_meta.get('raw_delivery_content') or delivery_content,
+                                    'rule_meta': rule_meta,
+                                    'unit_index': i + 1
+                                })
+                                # 预占状态标记（失败时由 for 循环的 except 统一释放，避免双重释放）
+                                if not self._mark_data_reservation_sent_if_needed(rule_meta):
+                                    raise Exception('批量数据预占标记已发送失败')
                                 self._persist_delivery_finalization_state(
-                                    order_id=order_id,
-                                    item_id=item_id,
-                                    buyer_id=send_user_id,
-                                    delivery_meta=rule_meta,
-                                    channel='auto',
-                                    status='sent',
-                                    last_error=last_delivery_error
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    delivery_meta=rule_meta, channel='auto', status='sent'
                                 )
+                            else:
+                                # 遇到非纯文本内容，先刷新已收集的文本以保持消息顺序
+                                await _flush_collected_texts()
+                                # 立即发送当前内容
+                                await self._send_delivery_steps(
+                                    websocket, chat_id, send_user_id, delivery_steps,
+                                    user_url=user_url,
+                                    log_prefix=f'[{msg_time}] 自动发货'
+                                )
+
+                                if not self._mark_data_reservation_sent_if_needed(rule_meta):
+                                    self._release_data_reservation_if_needed(rule_meta, error='发送成功后标记预占已发送失败')
+                                    raise Exception('批量数据预占标记已发送失败')
+
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    delivery_meta=rule_meta, channel='auto', status='sent'
+                                )
+
+                                finalize_result = await self._finalize_delivery_after_send(
+                                    delivery_meta=rule_meta, order_id=order_id, item_id=item_id
+                                )
+                                if not finalize_result.get('success'):
+                                    last_delivery_error = finalize_result.get('error') or f"第 {i+1} 条消息发送成功但提交发货副作用失败"
+                                    self._persist_delivery_finalization_state(
+                                        order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                        delivery_meta=rule_meta, channel='auto', status='sent', last_error=last_delivery_error
+                                    )
+                                    self._record_delivery_log(
+                                        order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                        buyer_nick=send_user_name, status='failed', reason=last_delivery_error,
+                                        channel='auto', rule_meta=rule_meta
+                                    )
+                                    logger.error(last_delivery_error)
+                                    continue
+
+                                self._persist_delivery_finalization_state(
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    delivery_meta=rule_meta, channel='auto', status='finalized'
+                                )
+
+                                successful_send_count += 1
+                                has_image_step = any(step.get('type') == 'image' for step in delivery_steps)
+                                success_reason = '自动发货图片步骤发送成功' if has_image_step else '自动发货文本发送成功'
                                 self._record_delivery_log(
-                                    order_id=order_id,
-                                    item_id=item_id,
-                                    buyer_id=send_user_id,
-                                    buyer_nick=send_user_name,
-                                    status='failed',
-                                    reason=last_delivery_error,
-                                    channel='auto',
-                                    rule_meta=rule_meta
+                                    order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                    buyer_nick=send_user_name, status='success', reason=success_reason,
+                                    channel='auto', rule_meta=rule_meta
                                 )
-                                logger.error(last_delivery_error)
-                                continue
 
-                            self._persist_delivery_finalization_state(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=send_user_id,
-                                delivery_meta=rule_meta,
-                                channel='auto',
-                                status='finalized'
-                            )
-
-                            successful_send_count += 1
-
-                            has_image_step = any(step.get('type') == 'image' for step in delivery_steps)
-                            success_reason = '自动发货图片步骤发送成功' if has_image_step else '自动发货文本发送成功'
-                            self._record_delivery_log(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=send_user_id,
-                                buyer_nick=send_user_name,
-                                status='success',
-                                reason=success_reason,
-                                channel='auto',
-                                rule_meta=rule_meta
-                            )
-
-                            if quantity_to_send > 1 and i < quantity_to_send - 1:
-                                await asyncio.sleep(1)
+                                if quantity_to_send > 1 and i < quantity_to_send - 1:
+                                    await asyncio.sleep(1)
 
                         except Exception as e:
                             self._release_data_reservation_if_needed(rule_meta, error=f'发送失败: {self._safe_str(e)}')
                             last_delivery_error = f"发送第 {i+1}/{quantity_to_send} 个卡券失败: {self._safe_str(e)}"
                             self._record_delivery_log(
-                                order_id=order_id,
-                                item_id=item_id,
-                                buyer_id=send_user_id,
-                                buyer_nick=send_user_name,
-                                status='failed',
-                                reason=last_delivery_error,
-                                channel='auto',
-                                rule_meta=rule_meta
+                                order_id=order_id, item_id=item_id, buyer_id=send_user_id,
+                                buyer_nick=send_user_name, status='failed', reason=last_delivery_error,
+                                channel='auto', rule_meta=rule_meta
                             )
                             logger.error(last_delivery_error)
+
+                    # 循环结束后，合并发送剩余的纯文本内容
+                    await _flush_collected_texts()
 
                     progress_summary = self._sync_order_delivery_progress(
                         order_id=order_id,
@@ -6066,7 +6122,7 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"更新卡券图片URL失败: {e}")
 
-    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str):
+    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str, image_url: str = None):
         """获取AI回复"""
         try:
             from ai_reply_engine import ai_reply_engine
@@ -6105,7 +6161,8 @@ class XianyuLive:
                 cookie_id=self.cookie_id,
                 user_id=send_user_id,
                 item_id=item_id,
-                skip_wait=True  # 跳过内部等待，因为外部已实现防抖
+                skip_wait=True,  # 跳过内部等待，因为外部已实现防抖
+                image_url=image_url
             )
 
             if reply:
@@ -8018,6 +8075,7 @@ Cookie数量: {cookie_count}
                 delivery_content = None
                 data_line = None
                 data_reservation = None
+                delivery_error_reason = None  # 用于记录发货失败的具体原因
 
                 # 根据卡券类型处理发货内容
                 if rule['card_type'] == 'api':
@@ -8046,6 +8104,7 @@ Cookie数量: {cookie_count}
                         delivery_content = data_line
                     else:
                         delivery_content = None
+                        delivery_error_reason = "卡密数据耗尽"
 
                 elif rule['card_type'] == 'image':
                     # 图片类型：返回图片发送标记，包含卡券ID
@@ -8056,6 +8115,7 @@ Cookie数量: {cookie_count}
                     else:
                         logger.error(f"图片卡券缺少图片URL: 卡券ID={rule['card_id']}")
                         delivery_content = None
+                        delivery_error_reason = "图片卡券未配置图片URL"
 
                 if delivery_content:
                     delivery_steps = self._build_delivery_steps(delivery_content, rule.get('card_description', ''))
@@ -8084,10 +8144,23 @@ Cookie数量: {cookie_count}
                         result['data_reservation_id'] = data_reservation.get('id') if data_reservation else None
                         result['data_reservation_status'] = data_reservation.get('status') if data_reservation else None
                         result['delivery_unit_index'] = delivery_unit_index
+                        result['raw_delivery_content'] = delivery_content  # 原始发货内容（未应用模板）
                     return result
                 else:
-                    logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
-                    return build_result(False, error=f"获取发货内容失败: 规则ID={rule['id']}", matched_rule=rule, match_mode_value=match_mode)
+                    # 根据卡券类型生成具体的错误原因
+                    if not delivery_error_reason:
+                        if rule['card_type'] == 'api':
+                            delivery_error_reason = "API调用返回空内容"
+                        elif rule['card_type'] == 'yifan_api':
+                            delivery_error_reason = "亦凡API调用返回空内容"
+                        elif rule['card_type'] == 'text':
+                            delivery_error_reason = "文字卡券内容为空"
+                        else:
+                            delivery_error_reason = f"未知原因({rule['card_type']})"
+
+                    error_msg = f"获取发货内容失败: 规则ID={rule['id']}, 卡券={rule.get('card_name', '未知')}, 原因={delivery_error_reason}"
+                    logger.warning(error_msg)
+                    return build_result(False, error=error_msg, matched_rule=rule, match_mode_value=match_mode)
             else:
                 # 没有订单ID，记录日志但不处理发货内容
                 logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
@@ -10746,9 +10819,9 @@ Cookie数量: {cookie_count}
         
         return None
 
-    async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket, 
+    async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
-                                       item_id: str, msg_time: str):
+                                       item_id: str, msg_time: str, image_url: str = None):
         """
         调度防抖回复：如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
         
@@ -10838,7 +10911,8 @@ Cookie数量: {cookie_count}
                     'send_user_id': send_user_id,
                     'send_message': send_message,
                     'item_id': item_id,
-                    'msg_time': msg_time
+                    'msg_time': msg_time,
+                    'image_url': image_url
                 },
                 'timer': current_timer
             }
@@ -10877,7 +10951,8 @@ Cookie数量: {cookie_count}
                         last_msg['send_message'],
                         last_msg['item_id'],
                         chat_id,
-                        last_msg['msg_time']
+                        last_msg['msg_time'],
+                        image_url=last_msg.get('image_url')
                     )
                     
                 except asyncio.CancelledError:
@@ -10895,7 +10970,7 @@ Cookie数量: {cookie_count}
 
     async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
                                          send_user_id: str, send_message: str, item_id: str,
-                                         chat_id: str, msg_time: str):
+                                         chat_id: str, msg_time: str, image_url: str = None):
         """
         处理聊天消息的回复逻辑（从handle_message中提取出来的核心回复逻辑）
         
@@ -10951,7 +11026,7 @@ Cookie数量: {cookie_count}
                     reply_source = '关键词'  # 标记为关键词回复
                 else:
                     # 2. 关键词匹配失败，如果AI开关打开，尝试AI回复
-                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id, image_url=image_url)
                     if reply:
                         reply_source = 'AI'  # 标记为AI回复
                     else:
@@ -11459,6 +11534,23 @@ Cookie数量: {cookie_count}
                 f"auto_reply={allow_auto_reply}, system={is_system_message}, "
                 f"direction={message_direction}, contentType={content_type}"
             )
+
+            # 提取图片URL（当 contentType==2 时，从消息体中解析图片链接）
+            image_url = None
+            if content_type == 2:
+                try:
+                    msg_body = message_1.get('6', {})
+                    if isinstance(msg_body, dict):
+                        msg_body_3 = msg_body.get('3', {})
+                        if isinstance(msg_body_3, dict) and '5' in msg_body_3:
+                            content_json = json.loads(msg_body_3['5'])
+                            pics = content_json.get('image', {}).get('pics', [])
+                            if pics and isinstance(pics, list):
+                                image_url = pics[0].get('url', '')
+                                if image_url:
+                                    logger.info(f"【{self.cookie_id}】[{msg_id}] 检测到图片消息，图片URL: {image_url[:80]}...")
+                except Exception as img_e:
+                    logger.warning(f"【{self.cookie_id}】[{msg_id}] 提取图片URL失败: {self._safe_str(img_e)}")
 
             if send_user_id == self.myid and not is_system_message:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】[{msg_id}] 【手动发出】 商品({item_id}): {send_message}")
@@ -11981,7 +12073,8 @@ Cookie数量: {cookie_count}
                 send_user_id=send_user_id,
                 send_message=send_message,
                 item_id=item_id,
-                msg_time=msg_time
+                msg_time=msg_time,
+                image_url=image_url
             )
 
         except Exception as e:

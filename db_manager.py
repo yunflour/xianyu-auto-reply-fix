@@ -368,6 +368,7 @@ class DBManager:
                 max_discount_amount INTEGER DEFAULT 100,
                 max_bargain_rounds INTEGER DEFAULT 3,
                 custom_prompts TEXT,
+                vision_enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
@@ -928,6 +929,12 @@ Cookie数量: {cookie_count}
                 logger.info("添加ai_reply_settings表的api_type列...")
                 cursor.execute("ALTER TABLE ai_reply_settings ADD COLUMN api_type TEXT DEFAULT ''")
                 logger.info("数据库迁移完成：添加api_type列")
+
+            # 检查ai_reply_settings表是否存在vision_enabled列
+            if 'vision_enabled' not in ai_columns:
+                logger.info("添加ai_reply_settings表的vision_enabled列...")
+                cursor.execute("ALTER TABLE ai_reply_settings ADD COLUMN vision_enabled BOOLEAN DEFAULT TRUE")
+                logger.info("数据库迁移完成：添加vision_enabled列")
 
             # 检查ai_config_presets表是否存在api_type列
             cursor.execute("PRAGMA table_info(ai_config_presets)")
@@ -2776,8 +2783,8 @@ Cookie数量: {cookie_count}
                 INSERT OR REPLACE INTO ai_reply_settings
                 (cookie_id, ai_enabled, model_name, api_key, base_url, api_type,
                  max_discount_percent, max_discount_amount, max_bargain_rounds,
-                 custom_prompts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                 custom_prompts, vision_enabled, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     cookie_id,
                     settings.get('ai_enabled', False),
@@ -2788,7 +2795,8 @@ Cookie数量: {cookie_count}
                     settings.get('max_discount_percent', 10),
                     settings.get('max_discount_amount', 100),
                     settings.get('max_bargain_rounds', 3),
-                    settings.get('custom_prompts', '')
+                    settings.get('custom_prompts', ''),
+                    settings.get('vision_enabled', True)
                 ))
                 self.conn.commit()
                 logger.debug(f"AI回复设置保存成功: {cookie_id}")
@@ -2806,7 +2814,7 @@ Cookie数量: {cookie_count}
                 cursor.execute('''
                 SELECT ai_enabled, model_name, api_key, base_url, api_type,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, vision_enabled
                 FROM ai_reply_settings WHERE cookie_id = ?
                 ''', (cookie_id,))
 
@@ -2821,7 +2829,8 @@ Cookie数量: {cookie_count}
                         'max_discount_percent': result[5],
                         'max_discount_amount': result[6],
                         'max_bargain_rounds': result[7],
-                        'custom_prompts': result[8]
+                        'custom_prompts': result[8],
+                        'vision_enabled': bool(result[9]) if result[9] is not None else True
                     }
                 else:
                     # 返回默认设置
@@ -2834,7 +2843,8 @@ Cookie数量: {cookie_count}
                         'max_discount_percent': 10,
                         'max_discount_amount': 100,
                         'max_bargain_rounds': 3,
-                        'custom_prompts': ''
+                        'custom_prompts': '',
+                        'vision_enabled': True
                     }
             except Exception as e:
                 logger.error(f"获取AI回复设置失败: {e}")
@@ -2847,7 +2857,8 @@ Cookie数量: {cookie_count}
                     'max_discount_percent': 10,
                     'max_discount_amount': 100,
                     'max_bargain_rounds': 3,
-                    'custom_prompts': ''
+                    'custom_prompts': '',
+                    'vision_enabled': True
                 }
 
     def get_all_ai_reply_settings(self) -> Dict[str, dict]:
@@ -2858,7 +2869,7 @@ Cookie数量: {cookie_count}
                 cursor.execute('''
                 SELECT cookie_id, ai_enabled, model_name, api_key, base_url, api_type,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, vision_enabled
                 FROM ai_reply_settings
                 ''')
 
@@ -2874,7 +2885,8 @@ Cookie数量: {cookie_count}
                         'max_discount_percent': row[6],
                         'max_discount_amount': row[7],
                         'max_bargain_rounds': row[8],
-                        'custom_prompts': row[9]
+                        'custom_prompts': row[9],
+                        'vision_enabled': bool(row[10]) if row[10] is not None else True
                     }
 
                 return result

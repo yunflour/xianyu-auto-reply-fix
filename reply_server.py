@@ -6361,6 +6361,7 @@ class AIReplySettings(BaseModel):
     max_discount_amount: int = 100
     max_bargain_rounds: int = 3
     custom_prompts: str = ""
+    vision_enabled: bool = True
 
 
 class AIConfigPreset(BaseModel):
