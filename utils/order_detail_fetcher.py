@@ -1828,8 +1828,16 @@ class OrderDetailFetcher:
             page_text = await self._get_page_text()
             fallback_result = self._extract_sku_from_text(page_text) if page_text else {}
 
-            # 获取规格元素（主通道）
+            # 获取规格元素（主通道）- 显式等待元素出现
             sku_selector = '.sku--u_ddZval'
+
+            # 尝试等待 SKU 元素出现（最多等待 5 秒）
+            try:
+                await self.page.wait_for_selector(sku_selector, timeout=5000)
+                logger.info("SKU 元素已出现")
+            except Exception as e:
+                logger.warning(f"等待 SKU 元素超时: {e}，将使用兜底解析")
+
             sku_elements = await self.page.query_selector_all(sku_selector)
             logger.info(f"找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
 
