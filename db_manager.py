@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 import os
 import threading
 import hashlib
@@ -17,6 +18,18 @@ from loguru import logger
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
+
+    @contextmanager
+    def _get_cursor(self):
+        """
+        获取数据库游标的上下文管理器
+        确保游标在使用后自动关闭，防止资源泄露
+        """
+        cursor = self.conn.cursor()
+        try:
+            yield cursor
+        finally:
+            cursor.close()
     
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
@@ -129,37 +142,37 @@ class DBManager:
     def _migrate_plaintext_cookie_secrets(self):
         """将 cookies 表中的明文敏感字段迁移为密文存储。"""
         with self.lock:
-            cursor = self.conn.cursor()
-            self._execute_sql(cursor, "SELECT id, value, password, proxy_pass FROM cookies")
-            rows = cursor.fetchall()
-            updated_count = 0
+            with self._get_cursor() as cursor:
+                self._execute_sql(cursor, "SELECT id, value, password, proxy_pass FROM cookies")
+                rows = cursor.fetchall()
+                updated_count = 0
 
-            for cookie_id, cookie_value, password, proxy_pass in rows:
-                update_fields = []
-                params = []
+                for cookie_id, cookie_value, password, proxy_pass in rows:
+                    update_fields = []
+                    params = []
 
-                if cookie_value and not self._is_encrypted_secret(cookie_value):
-                    update_fields.append("value = ?")
-                    params.append(self._encrypt_secret(cookie_value))
+                    if cookie_value and not self._is_encrypted_secret(cookie_value):
+                        update_fields.append("value = ?")
+                        params.append(self._encrypt_secret(cookie_value))
 
-                if password and not self._is_encrypted_secret(password):
-                    update_fields.append("password = ?")
-                    params.append(self._encrypt_secret(password))
+                    if password and not self._is_encrypted_secret(password):
+                        update_fields.append("password = ?")
+                        params.append(self._encrypt_secret(password))
 
-                if proxy_pass and not self._is_encrypted_secret(proxy_pass):
-                    update_fields.append("proxy_pass = ?")
-                    params.append(self._encrypt_secret(proxy_pass))
+                    if proxy_pass and not self._is_encrypted_secret(proxy_pass):
+                        update_fields.append("proxy_pass = ?")
+                        params.append(self._encrypt_secret(proxy_pass))
 
-                if not update_fields:
-                    continue
+                    if not update_fields:
+                        continue
 
-                params.append(cookie_id)
-                self._execute_sql(cursor, f"UPDATE cookies SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
-                updated_count += 1
+                    params.append(cookie_id)
+                    self._execute_sql(cursor, f"UPDATE cookies SET {', '.join(update_fields)} WHERE id = ?", tuple(params))
+                    updated_count += 1
 
-            if updated_count:
-                self.conn.commit()
-                logger.info(f"已迁移 {updated_count} 条 cookies 敏感字段为密文存储")
+                if updated_count:
+                    self.conn.commit()
+                    logger.info(f"已迁移 {updated_count} 条 cookies 敏感字段为密文存储")
 
     def _normalize_order_status(self, status: str) -> str:
         """标准化订单状态，统一为系统内部状态值。"""
@@ -1919,12 +1932,12 @@ Cookie数量: {cookie_count}
         """获取所有Cookie（支持用户隔离）"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                if user_id is not None:
-                    self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
-                else:
-                    self._execute_sql(cursor, "SELECT id, value FROM cookies")
-                return {row[0]: self._decrypt_secret(row[1]) for row in cursor.fetchall()}
+                with self._get_cursor() as cursor:
+                    if user_id is not None:
+                        self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
+                    else:
+                        self._execute_sql(cursor, "SELECT id, value FROM cookies")
+                    return {row[0]: self._decrypt_secret(row[1]) for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取所有Cookie失败: {e}")
                 return {}
@@ -1942,18 +1955,18 @@ Cookie数量: {cookie_count}
         """
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, created_at FROM cookies WHERE id = ?", (cookie_id,))
-                result = cursor.fetchone()
-                if result:
-                    cookie_value = self._decrypt_secret(result[1])
-                    return {
-                        'id': result[0],
-                        'cookies_str': cookie_value,  # 使用cookies_str字段名以匹配调用方期望
-                        'value': cookie_value,        # 保持向后兼容
-                        'created_at': result[2]
-                    }
-                return None
+                with self._get_cursor() as cursor:
+                    self._execute_sql(cursor, "SELECT id, value, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                    result = cursor.fetchone()
+                    if result:
+                        cookie_value = self._decrypt_secret(result[1])
+                        return {
+                            'id': result[0],
+                            'cookies_str': cookie_value,  # 使用cookies_str字段名以匹配调用方期望
+                            'value': cookie_value,        # 保持向后兼容
+                            'created_at': result[2]
+                        }
+                    return None
             except Exception as e:
                 logger.error(f"根据ID获取Cookie失败: {e}")
                 return None
@@ -1962,37 +1975,37 @@ Cookie数量: {cookie_count}
         """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password、show_browser和代理配置"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                self._execute_sql(cursor, """
-                    SELECT id, value, user_id, auto_confirm, remark, pause_duration, 
-                           username, password, show_browser, created_at,
-                           proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
-                    FROM cookies WHERE id = ?
-                """, (cookie_id,))
-                result = cursor.fetchone()
-                if result:
-                    cookie_value = self._decrypt_secret(result[1])
-                    password = self._decrypt_secret(result[7])
-                    proxy_pass = self._decrypt_secret(result[14])
-                    return {
-                        'id': result[0],
-                        'value': cookie_value,
-                        'user_id': result[2],
-                        'auto_confirm': bool(result[3]),
-                        'remark': result[4] or '',
-                        'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
-                        'username': result[6] or '',
-                        'password': password,
-                        'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9],
-                        # 代理配置
-                        'proxy_type': result[10] or 'none',
-                        'proxy_host': result[11] or '',
-                        'proxy_port': result[12] or 0,
-                        'proxy_user': result[13] or '',
-                        'proxy_pass': proxy_pass
-                    }
-                return None
+                with self._get_cursor() as cursor:
+                    self._execute_sql(cursor, """
+                        SELECT id, value, user_id, auto_confirm, remark, pause_duration,
+                               username, password, show_browser, created_at,
+                               proxy_type, proxy_host, proxy_port, proxy_user, proxy_pass
+                        FROM cookies WHERE id = ?
+                    """, (cookie_id,))
+                    result = cursor.fetchone()
+                    if result:
+                        cookie_value = self._decrypt_secret(result[1])
+                        password = self._decrypt_secret(result[7])
+                        proxy_pass = self._decrypt_secret(result[14])
+                        return {
+                            'id': result[0],
+                            'value': cookie_value,
+                            'user_id': result[2],
+                            'auto_confirm': bool(result[3]),
+                            'remark': result[4] or '',
+                            'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
+                            'username': result[6] or '',
+                            'password': password,
+                            'show_browser': bool(result[8]) if result[8] is not None else False,
+                            'created_at': result[9],
+                            # 代理配置
+                            'proxy_type': result[10] or 'none',
+                            'proxy_host': result[11] or '',
+                            'proxy_port': result[12] or 0,
+                            'proxy_user': result[13] or '',
+                            'proxy_pass': proxy_pass
+                        }
+                    return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
@@ -6712,36 +6725,36 @@ Cookie数量: {cookie_count}
         """根据订单ID获取订单信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
-                       spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, pre_refund_status, cookie_id, created_at, updated_at
-                FROM orders WHERE order_id = ?
-                ''', (order_id,))
+                with self._get_cursor() as cursor:
+                    cursor.execute('''
+                    SELECT order_id, item_id, buyer_id, buyer_nick, sid, spec_name, spec_value,
+                           spec_name_2, spec_value_2, quantity, amount, bargain_flow_detected, bargain_success_detected, order_status, pre_refund_status, cookie_id, created_at, updated_at
+                    FROM orders WHERE order_id = ?
+                    ''', (order_id,))
 
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'order_id': row[0],
-                        'item_id': row[1],
-                        'buyer_id': row[2],
-                        'buyer_nick': row[3],
-                        'sid': row[4],
-                        'spec_name': row[5],
-                        'spec_value': row[6],
-                        'spec_name_2': row[7],
-                        'spec_value_2': row[8],
-                        'quantity': row[9],
-                        'amount': row[10],
-                        'bargain_flow_detected': bool(row[11]),
-                        'bargain_success_detected': bool(row[12]),
-                        'order_status': row[13],
-                        'pre_refund_status': row[14],
-                        'cookie_id': row[15],
-                        'created_at': row[16],
-                        'updated_at': row[17]
-                    }
-                return None
+                    row = cursor.fetchone()
+                    if row:
+                        return {
+                            'order_id': row[0],
+                            'item_id': row[1],
+                            'buyer_id': row[2],
+                            'buyer_nick': row[3],
+                            'sid': row[4],
+                            'spec_name': row[5],
+                            'spec_value': row[6],
+                            'spec_name_2': row[7],
+                            'spec_value_2': row[8],
+                            'quantity': row[9],
+                            'amount': row[10],
+                            'bargain_flow_detected': bool(row[11]),
+                            'bargain_success_detected': bool(row[12]),
+                            'order_status': row[13],
+                            'pre_refund_status': row[14],
+                            'cookie_id': row[15],
+                            'created_at': row[16],
+                            'updated_at': row[17]
+                        }
+                    return None
 
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")

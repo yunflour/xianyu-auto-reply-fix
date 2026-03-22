@@ -87,7 +87,7 @@ class OrderStatusHandler:
     def extract_order_id(self, message: dict) -> Optional[str]:
         """从消息中提取订单ID"""
         try:
-            logger.info(f"🔍 完整消息结构: {message}")
+            logger.debug(f"🔍 消息摘要: type={message.get('type')}, size={len(str(message))} bytes")
 
             for source, candidate_text in self._collect_order_id_candidate_texts(message, root='message'):
                 order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)

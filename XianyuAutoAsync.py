@@ -753,6 +753,7 @@ class XianyuLive:
         logger.info(f"【{cookie_id}】cookies解析完成，包含字段: {list(self.cookies.keys())}")
 
         self.cookie_id = cookie_id  # 唯一账号标识
+        self.last_memory_log = 0  # 上次内存日志时间
         self.cookies_str = cookies_str  # 保存原始cookie字符串
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
         self.base_url = WEBSOCKET_URL
@@ -2934,7 +2935,7 @@ class XianyuLive:
         """
         try:
             # 先查看消息的完整结构
-            logger.warning(f"【{self.cookie_id}】🔍 完整消息结构: {message}")
+            logger.debug(f"【{self.cookie_id}】🔍 消息摘要: type={message.get('type')}, size={len(str(message))} bytes")
 
             for source, candidate_text in self._collect_order_id_candidate_texts(message, root='message'):
                 order_id = self._extract_order_id_from_candidate_text(candidate_text, source=source)
@@ -12097,6 +12098,25 @@ Cookie数量: {cookie_count}
 
             while True:
                 try:
+                    # 内存监控
+                    current_time = time.time()
+                    if current_time - self.last_memory_log > 300:  # 每5分钟
+                        try:
+                            import psutil
+                            process = psutil.Process(os.getpid())
+                            memory_info = process.memory_info()
+                            memory_mb = memory_info.rss / 1024 / 1024
+                            logger.info(f"【{self.cookie_id}】💾 内存使用: {memory_mb:.1f}MB")
+                            self.last_memory_log = current_time
+
+                            # 如果内存超过500MB，触发GC
+                            if memory_mb > 500:
+                                import gc
+                                collected = gc.collect()
+                                logger.warning(f"【{self.cookie_id}】🧹 触发垃圾回收，清理了 {collected} 个对象")
+                        except Exception as e:
+                            logger.debug(f"内存监控异常: {e}")
+
                     # 检查账号是否启用
                     from cookie_manager import manager as cookie_manager
                     if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
