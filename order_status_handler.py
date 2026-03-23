@@ -107,8 +107,10 @@ class OrderStatusHandler:
         if not normalized_text:
             return None
 
+        direct_match_found = False
         direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
         if direct_match:
+            direct_match_found = True
             normalized_text = direct_match.group(1)
 
         colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
@@ -116,9 +118,10 @@ class OrderStatusHandler:
         if long_numeric_parts:
             return long_numeric_parts[0]
 
-        generic_matches = re.findall(r'\d{16,}', normalized_text)
-        if generic_matches:
-            return generic_matches[0]
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
         return None
 
     def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
@@ -143,7 +146,6 @@ class OrderStatusHandler:
         text_lower = normalized_text.lower()
         if (
             'updatekey' in source_lower
-            or 'extjson' in source_lower
             or 'updatekey' in text_lower
             or ('trade_' in text_lower and ':' in normalized_text)
             or ('buyer_confirm' in text_lower and ':' in normalized_text)
@@ -278,6 +280,10 @@ class OrderStatusHandler:
         exact_mapping = {
             '[买家确认收货，交易成功]': 'completed',
             '[你已确认收货，交易成功]': 'completed',
+            '买家已确认收货，交易成功': 'completed',
+            '已确认收货，交易成功': 'completed',
+            '快给ta一个评价吧~': 'completed',
+            '快给ta一个评价吧～': 'completed',
             '[你已发货]': 'shipped',
             '你已发货': 'shipped',
             '[你已发货，请等待买家确认收货]': 'shipped',
@@ -311,6 +317,8 @@ class OrderStatusHandler:
         if '退款中' in normalized or '退货退款' in normalized or '退款关闭' in normalized:
             return 'refunding'
         if '买家确认收货' in normalized:
+            return 'completed'
+        if '快给ta一个评价吧' in normalized:
             return 'completed'
         if '已发货_卖家' in normalized or '等待买家收货' in normalized:
             return 'shipped'

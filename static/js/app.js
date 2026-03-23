@@ -11,6 +11,7 @@ let dashboardData = {
     accounts: [],
     totalKeywords: 0
 };
+let pendingAccountManagementFocusId = '';
 
 // 账号关键词缓存
 let accountKeywordCache = {};
@@ -284,6 +285,230 @@ function initDarkMode() {
 // 【仪表盘菜单】相关功能
 // ================================
 
+async function fetchDashboardResource(path, fallbackValue) {
+    try {
+        const response = await fetch(`${apiBase}${path}`, {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+
+        if (!response.ok) {
+            return fallbackValue;
+        }
+
+        return await response.json();
+    } catch (error) {
+        console.error(`加载仪表盘资源失败: ${path}`, error);
+        return fallbackValue;
+    }
+}
+
+async function enrichDashboardAccounts(accounts) {
+    const scheduledTaskData = await fetchDashboardResource('/scheduled-tasks', { success: false, tasks: [] });
+    const scheduledTasks = scheduledTaskData && scheduledTaskData.success ? (scheduledTaskData.tasks || []) : [];
+
+    return Promise.all(accounts.map(async (account) => {
+        const [keywordsData, defaultReplyData, aiReplyData] = await Promise.all([
+            fetchDashboardResource(`/keywords/${encodeURIComponent(account.id)}`, []),
+            fetchDashboardResource(`/default-replies/${encodeURIComponent(account.id)}`, { enabled: false, reply_content: '' }),
+            fetchDashboardResource(`/ai-reply-settings/${encodeURIComponent(account.id)}`, { ai_enabled: false, model_name: 'qwen-plus' })
+        ]);
+
+        return {
+            ...account,
+            keywords: Array.isArray(keywordsData) ? keywordsData : [],
+            keywordCount: Array.isArray(keywordsData) ? keywordsData.length : 0,
+            defaultReply: defaultReplyData || { enabled: false, reply_content: '' },
+            aiReply: aiReplyData || { ai_enabled: false, model_name: 'qwen-plus' },
+            polishSchedule: getPolishScheduledTask(scheduledTasks, account.id)
+        };
+    }));
+}
+
+function renderDashboardSummaryCard(label, value, tone = 'primary', details = []) {
+    const detailMarkup = Array.isArray(details) && details.length ? `
+        <div class="dashboard-account-summary-details">
+            ${details.map(([detailLabel, detailValue]) => `
+                <span class="dashboard-account-summary-detail">
+                    <span class="dashboard-account-summary-detail-label">${escapeHtml(detailLabel)}</span>
+                    <span class="dashboard-account-summary-detail-value">${escapeHtml(detailValue)}</span>
+                </span>
+            `).join('')}
+        </div>
+    ` : '';
+
+    return `
+        <div class="dashboard-account-summary-item is-${tone}">
+            <div class="dashboard-account-summary-main">
+                <div class="dashboard-account-summary-label">${escapeHtml(label)}</div>
+            </div>
+            <div class="dashboard-account-summary-side">
+                <div class="dashboard-account-summary-value">${escapeHtml(value)}</div>
+                ${detailMarkup}
+            </div>
+        </div>
+    `;
+}
+
+function renderDashboardAccountMetric(label, value, tone = 'off') {
+    return `
+        <div class="dashboard-account-metric is-${tone}">
+            <div class="dashboard-account-metric-label">${escapeHtml(label)}</div>
+            <div class="dashboard-account-metric-value">${escapeHtml(value)}</div>
+        </div>
+    `;
+}
+
+function renderDashboardAccountCard(account) {
+    const isEnabled = account.enabled === undefined ? true : account.enabled;
+    const keywordCount = account.keywordCount || 0;
+    const defaultReplyEnabled = Boolean(account.defaultReply?.enabled);
+    const aiReplyEnabled = Boolean(account.aiReply?.ai_enabled);
+    const autoConfirmEnabled = account.auto_confirm === undefined ? true : Boolean(account.auto_confirm);
+    const autoCommentEnabled = Boolean(account.auto_comment);
+    const hasCredentials = Boolean(account.username) && Boolean(account.has_password);
+    const hasPartialCredentials = !hasCredentials && (Boolean(account.username) || Boolean(account.has_password));
+    const pauseDuration = account.pause_duration === 0 ? '不暂停' : `${account.pause_duration || 10} 分钟`;
+    const polishSchedule = account.polishSchedule;
+    const remarkText = account.remark || '';
+
+    let replyModeText = '未开启';
+    let replyModeTone = 'off';
+    if (aiReplyEnabled && defaultReplyEnabled) {
+        replyModeText = 'AI + 默认';
+        replyModeTone = 'info';
+    } else if (aiReplyEnabled) {
+        replyModeText = 'AI 回复';
+        replyModeTone = 'info';
+    } else if (defaultReplyEnabled) {
+        replyModeText = '默认回复';
+        replyModeTone = 'on';
+    }
+
+    let polishScheduleMetricText = '未设置';
+    let polishScheduleTone = 'off';
+    if (polishSchedule) {
+        if (polishSchedule.enabled) {
+            const displayHour = formatPolishScheduleHour(polishSchedule.delay_minutes ?? polishSchedule.run_hour);
+            polishScheduleMetricText = `${displayHour}`;
+            polishScheduleTone = 'info';
+        } else {
+            const displayHour = formatPolishScheduleHour(polishSchedule.delay_minutes ?? polishSchedule.run_hour);
+            polishScheduleMetricText = `${displayHour} 未开`;
+            polishScheduleTone = 'warn';
+        }
+    } else if (isEnabled) {
+        polishScheduleMetricText = '未设置';
+        polishScheduleTone = 'off';
+    }
+
+    const metrics = [
+        renderDashboardAccountMetric('关键词', keywordCount > 0 ? `${keywordCount} 个` : '未配置', keywordCount > 0 ? 'on' : 'off'),
+        renderDashboardAccountMetric('回复模式', replyModeText, replyModeTone),
+        renderDashboardAccountMetric('定时擦亮', polishScheduleMetricText, polishScheduleTone)
+    ].join('');
+
+    const secondarySummary = [
+        {
+            label: '关键词',
+            icon: 'chat-left-text-fill',
+            tone: keywordCount > 0 ? 'on' : 'off'
+        },
+        {
+            label: '自动发货',
+            icon: 'lightning-charge-fill',
+            tone: autoConfirmEnabled ? 'on' : 'off'
+        },
+        {
+            label: '自动好评',
+            icon: 'chat-heart-fill',
+            tone: autoCommentEnabled ? 'on' : 'off'
+        },
+        {
+            label: '账密',
+            icon: hasPartialCredentials ? 'exclamation-triangle-fill' : 'shield-lock-fill',
+            tone: hasCredentials ? 'info' : (hasPartialCredentials ? 'warn' : 'off')
+        },
+        {
+            label: '暂停',
+            value: pauseDuration,
+            icon: 'clock-history',
+            tone: 'neutral'
+        }
+    ].map(({ label, value = '', icon, tone }) => `
+        <span class="dashboard-account-secondary-pill is-${tone}">
+            <i class="bi bi-${icon} dashboard-account-secondary-pill-icon"></i>
+            <span class="dashboard-account-secondary-pill-label">${escapeHtml(label)}</span>
+            ${value ? `<span class="dashboard-account-secondary-pill-value">${escapeHtml(value)}</span>` : ''}
+        </span>
+    `).join('');
+
+    return `
+        <div class="dashboard-account-card ${isEnabled ? '' : 'is-disabled'}" data-account-id="${escapeHtml(account.id)}" role="button" tabindex="0" onclick="openAccountManagement(this.dataset.accountId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAccountManagement(this.dataset.accountId);}">
+            <div class="dashboard-account-card-head">
+                <div class="dashboard-account-card-main">
+                    <div class="dashboard-account-card-title">
+                        <div class="dashboard-account-card-id">${escapeHtml(account.id)}</div>
+                        ${remarkText ? `<span class="dashboard-account-card-remark-badge">${escapeHtml(remarkText)}</span>` : ''}
+                    </div>
+                    <div class="dashboard-account-secondary">${secondarySummary}</div>
+                </div>
+                <div class="dashboard-account-card-side">
+                    <span class="dashboard-account-status ${isEnabled ? 'is-enabled' : 'is-disabled'}">
+                        <i class="bi bi-${isEnabled ? 'check-circle-fill' : 'pause-circle-fill'}"></i>
+                        ${isEnabled ? '启用中' : '已禁用'}
+                    </span>
+                </div>
+            </div>
+            <div class="dashboard-account-main-metrics">${metrics}</div>
+        </div>
+    `;
+}
+
+function renderDashboardAccountOverview(accounts, totalItems = 0) {
+    const summary = document.getElementById('dashboardAccountSummary');
+    const enabledContainer = document.getElementById('dashboardEnabledAccounts');
+    const disabledContainer = document.getElementById('dashboardDisabledAccounts');
+    const enabledHint = document.getElementById('dashboardEnabledAccountsHint');
+    const disabledHint = document.getElementById('dashboardDisabledAccountsHint');
+
+    if (!summary || !enabledContainer || !disabledContainer || !enabledHint || !disabledHint) {
+        return;
+    }
+
+    const enabledAccounts = accounts.filter(account => account.enabled === undefined ? true : account.enabled);
+    const disabledAccounts = accounts.filter(account => !(account.enabled === undefined ? true : account.enabled));
+    const activeKeywordAccounts = enabledAccounts.filter(account => (account.keywordCount || 0) > 0).length;
+    const totalKeywords = enabledAccounts.reduce((sum, account) => sum + (account.keywordCount || 0), 0);
+
+    summary.innerHTML = [
+        ['全部账号', String(accounts.length), 'primary', []],
+        ['已启用 / 已禁用', `${enabledAccounts.length} / ${disabledAccounts.length}`, 'success', []],
+        ['关键词总数', String(totalKeywords), 'info', []],
+        ['商品总数', String(totalItems), 'muted', []]
+    ].map(([label, value, tone, details]) => renderDashboardSummaryCard(label, value, tone, details)).join('');
+
+    enabledHint.textContent = `${enabledAccounts.length} 个账号`;
+    disabledHint.textContent = disabledAccounts.length ? `${disabledAccounts.length} 个账号待恢复` : '暂无禁用账号';
+
+    const sortAccounts = (items) => [...items].sort((a, b) => {
+        const keywordDiff = (b.keywordCount || 0) - (a.keywordCount || 0);
+        if (keywordDiff !== 0) {
+            return keywordDiff;
+        }
+        return String(a.id || '').localeCompare(String(b.id || ''), 'zh-Hans-CN');
+    });
+
+    enabledContainer.innerHTML = enabledAccounts.length
+        ? sortAccounts(enabledAccounts).map(renderDashboardAccountCard).join('')
+        : '<div class="dashboard-account-empty"><i class="bi bi-inbox me-1"></i>暂无启用账号</div>';
+
+    disabledContainer.innerHTML = disabledAccounts.length
+        ? sortAccounts(disabledAccounts).map(renderDashboardAccountCard).join('')
+        : '<div class="dashboard-account-empty"><i class="bi bi-inbox me-1"></i>暂无禁用账号</div>';
+}
+
 // 加载仪表盘数据
 async function loadDashboard() {
     try {
@@ -299,62 +524,13 @@ async function loadDashboard() {
     if (cookiesResponse.ok) {
         const cookiesData = await cookiesResponse.json();
 
-        // 为每个账号获取关键词信息
-        const accountsWithKeywords = await Promise.all(
-        cookiesData.map(async (account) => {
-            try {
-            const keywordsResponse = await fetch(`${apiBase}/keywords/${account.id}`, {
-                headers: {
-                'Authorization': `Bearer ${authToken}`
-                }
-            });
-
-            if (keywordsResponse.ok) {
-                const keywordsData = await keywordsResponse.json();
-                return {
-                ...account,
-                keywords: keywordsData,
-                keywordCount: keywordsData.length
-                };
-            } else {
-                return {
-                ...account,
-                keywords: [],
-                keywordCount: 0
-                };
-            }
-            } catch (error) {
-            console.error(`获取账号 ${account.id} 关键词失败:`, error);
-            return {
-                ...account,
-                keywords: [],
-                keywordCount: 0
-            };
-            }
-        })
-        );
+        const accountsWithKeywords = await enrichDashboardAccounts(cookiesData);
 
         dashboardData.accounts = accountsWithKeywords;
-
-        // 计算统计数据
-        let totalKeywords = 0;
-        let activeAccounts = 0;
-        let enabledAccounts = 0;
-
-        accountsWithKeywords.forEach(account => {
-        const keywordCount = account.keywordCount || 0;
+        dashboardData.totalKeywords = accountsWithKeywords.reduce((sum, account) => {
         const isEnabled = account.enabled === undefined ? true : account.enabled;
-
-        if (isEnabled) {
-            enabledAccounts++;
-            totalKeywords += keywordCount;
-            if (keywordCount > 0) {
-            activeAccounts++;
-            }
-        }
-        });
-
-        dashboardData.totalKeywords = totalKeywords;
+        return sum + (isEnabled ? (account.keywordCount || 0) : 0);
+        }, 0);
 
         // 加载商品总数
         const totalItems = await loadItemsCount();
@@ -369,8 +545,7 @@ async function loadDashboard() {
         await loadSalesChart('week');
 
         // 更新仪表盘显示
-        updateDashboardStats(accountsWithKeywords.length, totalKeywords, enabledAccounts, totalItems);
-        updateDashboardAccountsList(accountsWithKeywords);
+        renderDashboardAccountOverview(accountsWithKeywords, totalItems);
         await loadDashboardDeliveryLogs();
     }
     } catch (error) {
@@ -438,7 +613,10 @@ async function loadOrderDashboardMetrics() {
         orders.forEach(order => {
             const normalizedStatus = normalizeOrderStatus(order?.order_status);
             const parsedAmount = parseOrderAmount(order);
-            totalSalesAmount += parsedAmount;
+
+            if (isSalesEligibleOrder(normalizedStatus) && parsedAmount !== null) {
+                totalSalesAmount += parsedAmount;
+            }
 
             if (isCompletionEligibleOrder(normalizedStatus)) {
                 completionEligibleOrders++;
@@ -599,6 +777,7 @@ function stopSalesSummaryRefreshTimer() {
 // 销售额图表实例
 let salesChartInstance = null;
 let currentChartPeriod = null;
+let salesDateRangeOutsideClickBound = false;
 
 // 显示图表加载状态
 function showChartLoading() {
@@ -634,17 +813,13 @@ function hideChartLoading() {
 
 // 更新按钮激活状态
 function updateChartButtonState(activePeriod) {
-    const buttons = document.querySelectorAll('.time-range-selector .btn-group .btn');
+    const buttons = document.querySelectorAll('.sales-period-button');
     buttons.forEach(btn => {
         const btnPeriod = btn.dataset.period;
-        
-        if (btnPeriod === activePeriod) {
-            btn.classList.remove('btn-outline-primary');
-            btn.classList.add('btn-primary');
-        } else {
-            btn.classList.remove('btn-primary');
-            btn.classList.add('btn-outline-primary');
-        }
+        const isActive = btnPeriod === activePeriod;
+
+        btn.classList.toggle('is-active', isActive);
+        btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
     });
 }
 
@@ -652,6 +827,7 @@ function updateChartButtonState(activePeriod) {
 async function loadSalesChart(period) {
     showChartLoading();
     updateChartButtonState(period);
+    setDateRangePickerVisible(false);
     
     try {
         const token = localStorage.getItem('auth_token');
@@ -727,10 +903,64 @@ async function loadCustomSalesChart() {
     }
 }
 
+function setDateRangePickerVisible(visible) {
+    const dateRangePicker = document.getElementById('dateRangePicker');
+    const customButton = document.querySelector('.sales-period-button[data-period="custom"]');
+    const timeRangeSelector = document.querySelector('.time-range-selector');
+    if (!dateRangePicker) {
+        return;
+    }
+
+    dateRangePicker.hidden = !visible;
+    if (timeRangeSelector) {
+        timeRangeSelector.classList.toggle('is-open', visible);
+    }
+    if (customButton) {
+        customButton.setAttribute('aria-expanded', visible ? 'true' : 'false');
+    }
+
+    if (!salesDateRangeOutsideClickBound) {
+        document.addEventListener('click', event => {
+            const control = document.querySelector('.time-range-selector');
+            const picker = document.getElementById('dateRangePicker');
+            if (!control || !picker || picker.hidden) {
+                return;
+            }
+
+            if (!control.contains(event.target)) {
+                setDateRangePickerVisible(false);
+                updateChartButtonState(currentChartPeriod || 'week');
+            }
+        });
+
+        document.addEventListener('keydown', event => {
+            const picker = document.getElementById('dateRangePicker');
+            if (event.key === 'Escape' && picker && !picker.hidden) {
+                setDateRangePickerVisible(false);
+                updateChartButtonState(currentChartPeriod || 'week');
+            }
+        });
+
+        salesDateRangeOutsideClickBound = true;
+    }
+}
+
 // 切换日期选择器显示
 function toggleDateRangePicker() {
     const dateRangePicker = document.getElementById('dateRangePicker');
-    dateRangePicker.style.display = dateRangePicker.style.display === 'none' ? 'block' : 'none';
+    if (!dateRangePicker) {
+        return;
+    }
+
+    const willShow = dateRangePicker.hidden;
+    setDateRangePickerVisible(willShow);
+
+    if (willShow) {
+        updateChartButtonState('custom');
+        return;
+    }
+
+    updateChartButtonState(currentChartPeriod || 'week');
 }
 
 // 渲染销售额图表
@@ -917,13 +1147,16 @@ function parseOrderAmount(order) {
     for (const amount of amountCandidates) {
         if (amount === undefined || amount === null || amount === '') continue;
         const normalized = String(amount).replace(/[^\d.-]/g, '');
+        if (!normalized || normalized === '-' || normalized === '.' || normalized === '-.') {
+            continue;
+        }
         const numericAmount = parseFloat(normalized);
         if (!Number.isNaN(numericAmount)) {
             return numericAmount;
         }
     }
 
-    return 0;
+    return null;
 }
 
 function formatOrderAmountDisplay(rawAmount) {
@@ -964,8 +1197,13 @@ function isCompletedOrder(normalizedStatus) {
     return normalizedStatus === 'completed';
 }
 
+function isSalesEligibleOrder(normalizedStatus) {
+    const salesEligibleStatuses = ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed'];
+    return salesEligibleStatuses.includes(normalizedStatus);
+}
+
 function isCompletionEligibleOrder(normalizedStatus) {
-    const completionEligibleStatuses = ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'cancelled'];
+    const completionEligibleStatuses = ['pending_ship', 'partial_success', 'partial_pending_finalize', 'shipped', 'completed', 'cancelled', 'refunding', 'refund_cancelled'];
     return completionEligibleStatuses.includes(normalizedStatus);
 }
 
@@ -1025,60 +1263,31 @@ function updateDashboardOrderMetrics(metrics) {
 }
 
 // 更新仪表盘统计数据
-function updateDashboardStats(totalAccounts, totalKeywords, enabledAccounts, totalItems = 0) {
-    document.getElementById('totalAccounts').textContent = totalAccounts;
-    document.getElementById('totalKeywords').textContent = totalKeywords;
-    document.getElementById('activeAccounts').textContent = enabledAccounts;
-    document.getElementById('totalItems').textContent = totalItems;
+function openAccountManagement(accountId) {
+    pendingAccountManagementFocusId = accountId || '';
+    const accountsSection = document.getElementById('accounts-section');
+    if (accountsSection && accountsSection.classList.contains('active')) {
+        loadCookies();
+        return;
+    }
+    showSection('accounts');
 }
 
-// 更新仪表盘账号列表
-function updateDashboardAccountsList(accounts) {
-    const tbody = document.getElementById('dashboardAccountsList');
-    tbody.innerHTML = '';
-
-    if (accounts.length === 0) {
-    tbody.innerHTML = `
-        <tr>
-        <td colspan="4" class="text-center text-muted py-4">
-            <i class="bi bi-inbox fs-1 d-block mb-2"></i>
-            暂无账号数据
-        </td>
-        </tr>
-    `;
-    return;
+function focusPendingAccountManagementRow() {
+    if (!pendingAccountManagementFocusId) {
+        return;
     }
 
-    accounts.forEach(account => {
-    const keywordCount = account.keywordCount || 0;
-    const isEnabled = account.enabled === undefined ? true : account.enabled;
-
-    let status = '';
-    if (!isEnabled) {
-        status = '<span class="badge bg-danger">已禁用</span>';
-    } else if (keywordCount > 0) {
-        status = '<span class="badge bg-success">活跃</span>';
-    } else {
-        status = '<span class="badge bg-secondary">未配置</span>';
+    const rows = document.querySelectorAll('#cookieTable tbody tr[data-account-id]');
+    const targetRow = Array.from(rows).find(row => row.dataset.accountId === pendingAccountManagementFocusId);
+    if (!targetRow) {
+        return;
     }
 
-    const row = document.createElement('tr');
-    row.className = isEnabled ? '' : 'table-secondary';
-    row.innerHTML = `
-        <td>
-        <strong class="text-primary ${!isEnabled ? 'text-muted' : ''}">${account.id}</strong>
-        ${!isEnabled ? '<i class="bi bi-pause-circle-fill text-danger ms-1" title="已禁用"></i>' : ''}
-        </td>
-        <td>
-        <span class="badge ${isEnabled ? 'bg-primary' : 'bg-secondary'}">${keywordCount} 个关键词</span>
-        </td>
-        <td>${status}</td>
-        <td>
-        <small class="text-muted">${new Date().toLocaleString()}</small>
-        </td>
-    `;
-    tbody.appendChild(row);
-    });
+    pendingAccountManagementFocusId = '';
+    targetRow.classList.add('dashboard-account-focus');
+    targetRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    window.setTimeout(() => targetRow.classList.remove('dashboard-account-focus'), 2200);
 }
 
 async function loadDashboardDeliveryLogs() {
@@ -1103,7 +1312,7 @@ async function loadDashboardDeliveryLogs() {
         console.error('加载仪表盘发货日志失败:', error);
         tbody.innerHTML = `
             <tr>
-                <td colspan="5" class="text-center text-muted py-4">
+                <td colspan="8" class="text-center text-muted py-4">
                     <i class="bi bi-exclamation-triangle fs-4 d-block mb-2"></i>
                     发货日志加载失败
                 </td>
@@ -1121,7 +1330,7 @@ function renderDashboardDeliveryLogs(logs) {
     if (!logs.length) {
         tbody.innerHTML = `
             <tr>
-                <td colspan="5" class="text-center text-muted py-4">
+                <td colspan="8" class="text-center text-muted py-4">
                     <i class="bi bi-inbox fs-1 d-block mb-2"></i>
                     暂无发货日志
                 </td>
@@ -1173,15 +1382,30 @@ function renderDashboardDeliveryLogs(logs) {
             matchBadge = buildBadge(matchModeLabelMap[log.match_mode] || log.match_mode, 'bg-danger');
         }
 
-        const specBadges = [];
-        if (log.order_spec_mode) {
-            specBadges.push(buildBadge(`订单:${specModeLabelMap[log.order_spec_mode] || log.order_spec_mode}`, 'bg-info text-dark'));
+        const specModes = [log.order_spec_mode, log.rule_spec_mode, log.item_config_mode].filter(Boolean);
+        const uniqueSpecLabels = [...new Set(specModes.map(mode => specModeLabelMap[mode] || mode))];
+        const hasEnabledSpecMode = specModes.some(mode => ['one_spec', 'two_spec', 'spec_enabled'].includes(mode));
+        const hasNoSpecMode = specModes.some(mode => mode === 'no_spec');
+        let specModeTitle = '';
+        if (log.match_mode === 'blocked_rule_mode_mismatch') {
+            specModeTitle = uniqueSpecLabels.join(' / ') || '规格不一致';
+        } else if (log.match_mode === 'two_spec_exact' || specModes.includes('two_spec')) {
+            specModeTitle = '两组规格';
+        } else if (log.match_mode === 'one_spec_exact' || log.match_mode === 'one_spec_fallback_no_spec' || specModes.includes('one_spec')) {
+            specModeTitle = '一组规格';
+        } else if (log.match_mode === 'no_spec_match' || hasNoSpecMode) {
+            specModeTitle = '无规格';
+        } else if (specModes.includes('spec_enabled')) {
+            specModeTitle = '已开规格';
         }
-        if (log.rule_spec_mode) {
-            specBadges.push(buildBadge(`规则:${specModeLabelMap[log.rule_spec_mode] || log.rule_spec_mode}`, 'bg-light text-dark border'));
-        }
-        if (log.item_config_mode) {
-            specBadges.push(buildBadge(`商品:${specModeLabelMap[log.item_config_mode] || log.item_config_mode}`, 'bg-secondary'));
+
+        let specSummary = '<span class="text-muted">-</span>';
+        if (log.match_mode === 'blocked_rule_mode_mismatch') {
+            specSummary = `<span title="${escapeHtml(specModeTitle || '规格模式不一致')}">${buildBadge('规格不一致', 'bg-warning text-dark')}</span>`;
+        } else if (hasEnabledSpecMode || ['one_spec_exact', 'one_spec_fallback_no_spec', 'two_spec_exact'].includes(log.match_mode)) {
+            specSummary = `<span title="${escapeHtml(specModeTitle || '已开规格')}">${buildBadge('已开规格', 'bg-info text-dark')}</span>`;
+        } else if (hasNoSpecMode || log.match_mode === 'no_spec_match') {
+            specSummary = `<span title="${escapeHtml(specModeTitle || '未开规格')}">${buildBadge('未开规格', 'bg-secondary')}</span>`;
         }
 
         const ruleText = log.rule_keyword
@@ -1189,6 +1413,7 @@ function renderDashboardDeliveryLogs(logs) {
             : '<span class="text-muted">未命中规则</span>';
 
         const channelText = log.channel === 'manual' ? '手动' : '自动';
+        const channelBadgeClass = log.channel === 'manual' ? 'dashboard-delivery-channel-manual' : 'dashboard-delivery-channel-auto';
         const reasonText = isSuccess
             ? (log.reason || '发货成功')
             : (isSkipped
@@ -1199,15 +1424,13 @@ function renderDashboardDeliveryLogs(logs) {
         tr.innerHTML = `
             <td class="text-nowrap"><small>${escapeHtml(formatDateTime(log.created_at || ''))}</small></td>
             <td class="text-nowrap">${escapeHtml(log.order_id || '-')}</td>
-            <td>
-                ${ruleText}
-                <div class="mt-1 d-flex gap-1 align-items-center">
-                    ${matchBadge}
-                    <span class="badge bg-light text-dark border">${escapeHtml(channelText)}</span>
-                </div>
-                ${specBadges.length ? `<div class="mt-1 d-flex gap-1 align-items-center flex-wrap">${specBadges.join('')}</div>` : ''}
-            </td>
             <td>${statusBadge}</td>
+            <td>${ruleText}</td>
+            <td>${matchBadge}</td>
+            <td>${specSummary}</td>
+            <td>
+                <span class="badge ${channelBadgeClass}">${escapeHtml(channelText)}</span>
+            </td>
             <td class="dashboard-delivery-reason" title="${escapeHtml(reasonText)}">${escapeHtml(reasonText)}</td>
         `;
         tbody.appendChild(tr);
@@ -2538,6 +2761,7 @@ async function loadCookies() {
 
         const tr = document.createElement('tr');
         tr.className = `account-row ${isEnabled ? 'enabled' : 'disabled'}`;
+        tr.dataset.accountId = cookie.id;
         // 默认回复状态标签
         const defaultReplyBadge = cookie.defaultReply.enabled ?
         '<span class="badge bg-success">启用</span>' :
@@ -2640,10 +2864,13 @@ async function loadCookies() {
             <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-robot"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="copyCookie('${cookie.id}')" title="复制Cookie">
-                <i class="bi bi-clipboard"></i>
+            <button class="btn btn-sm btn-outline-secondary" onclick="polishAccountItems('${cookie.id}')" title="一键擦亮" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-stars"></i>
             </button>
-            
+            <button class="btn btn-sm btn-outline-info" onclick="openPolishScheduleModal('${cookie.id}')" title="定时擦亮" ${!isEnabled ? 'disabled' : ''}>
+                <i class="bi bi-clock"></i>
+            </button>
+
             <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
                 <i class="bi bi-trash"></i>
             </button>
@@ -2667,6 +2894,7 @@ async function loadCookies() {
 
     // 重新初始化工具提示
     initTooltips();
+    focusPendingAccountManagementRow();
 
     } catch (err) {
     // 错误已在fetchJSON中处理
@@ -2704,6 +2932,28 @@ async function copyCookie(id) {
     } catch (error) {
     console.error('获取Cookie详情失败:', error);
     showToast('获取Cookie详情失败，请稍后重试', 'danger');
+    }
+}
+
+// 一键擦亮
+async function polishAccountItems(accountId) {
+    toggleLoading(true);
+    showToast('正在擦亮所有商品，请稍候...', 'info');
+    try {
+        const response = await fetch(`${apiBase}/accounts/${encodeURIComponent(accountId)}/polish-items`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        const data = await response.json();
+        if (data.success) {
+            showToast(`擦亮完成: ${data.polished}/${data.total} 个商品成功`, 'success');
+        } else {
+            showToast(`擦亮失败: ${data.message}`, 'danger');
+        }
+    } catch (error) {
+        showToast(`擦亮请求异常: ${error.message}`, 'danger');
+    } finally {
+        toggleLoading(false);
     }
 }
 
@@ -7472,7 +7722,7 @@ const DEFAULT_MENU_ITEMS = [
     { id: 'message-notifications', name: '消息通知', icon: 'bi-chat-dots', required: false },
     { id: 'online-im', name: '在线客服', icon: 'bi-headset', required: false },
     { id: 'system-settings', name: '系统设置', icon: 'bi-gear', required: true },
-    { id: 'about', name: '关于', icon: 'bi-info-circle', required: false }
+    { id: 'about', name: '关于', icon: 'bi-info-circle', required: true }
 ];
 
 // 当前菜单设置
@@ -14987,7 +15237,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.7.0';
+const DEFAULT_VERSION = 'v1.7.4';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -15101,9 +15351,49 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.7.0',
+    version: 'v1.7.4',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.7.4',
+            date: '2026-03-22',
+            updates: [
+                '【修复】收紧订单号提取规则，避免普通消息中的 messageId 被误识别为订单号并生成处理中假订单',
+                '【修复】统一销售统计口径并跳过空金额/脏金额订单，修复销售额卡片获取失败的问题',
+                '【优化】重构仪表盘账号概览、订单数据看板、销售趋势与发货日志展示，关键信息更清晰易读',
+                '【优化】发货日志拆分规则、匹配结果、触发方式和规格状态列，并简化规格状态显示便于快速排查'
+            ]
+        },
+        {
+            version: 'v1.7.3',
+            date: '2026-03-21',
+            updates: [
+                '【修复】热更新清单改为优先读取上一版 Release 资产中的 update_files.json，避免 deleted_files 丢失',
+                '【修复】修正同版本下热更新可能回滚清单生成脚本的问题，补齐删除清单并完善后续版本生成逻辑'
+            ]
+        },
+        {
+            version: 'v1.7.2',
+            date: '2026-03-20',
+            updates: [
+                '【新功能】账号列表新增商品一键擦亮入口，可批量执行当前在售商品擦亮',
+                '【新功能】新增每日定时擦亮任务，支持按账号配置启用状态、执行时段与随机延迟',
+                '【优化】后台新增定时任务调度与执行结果记录，便于查看下次执行时间和最近运行情况',
+                '【优化】管理端补充擦亮相关操作入口与设置弹窗，日常运营更方便',
+                '【优化】账号管理页调整列表列宽与仪表盘赞助按钮样式，提升界面可读性与交互一致性'
+            ]
+        },
+        {
+            version: 'v1.7.1',
+            date: '2026-03-19',
+            updates: [
+                '【修复】订单规格识别改为优先读取结构化订单响应中的 skuInfo 和数量，减少页面元素缺失导致的漏识别',
+                '【修复】正文兜底不再把标题、描述等冒号文案误判为第二规格，避免单规格订单被错误识别为双规格',
+                '【优化】正文规格过滤只保留更像真实 SKU 字段的候选，进一步过滤时间、广告文案和无关文本',
+                '【修复】订单明确解析为单规格时自动清空历史残留的第二规格字段，避免旧脏数据继续影响发货匹配',
+                '【优化】多规格商品复用缓存时要求金额、状态和主规格同时有效，降低脏缓存复用风险'
+            ]
+        },
         {
             version: 'v1.7.0',
             date: '2026-03-19',
@@ -17166,5 +17456,224 @@ function loadOnlineIm() {
     if (iframe && iframe.src === 'about:blank') {
         const realSrc = iframe.dataset.src || 'https://www.goofish.com/im';
         iframe.src = realSrc;
+    }
+}
+
+// ==================== 定时擦亮任务管理 ====================
+
+const POLISH_SCHEDULE_RANDOM_MINUTES = 10;
+
+async function loadScheduledTasks() {
+    try {
+        const data = await fetchJSON(`${apiBase}/scheduled-tasks`);
+        if (data.success) {
+            return data.tasks || [];
+        }
+        showToast(`加载定时任务失败: ${data.message || '未知错误'}`, 'danger');
+        return [];
+    } catch (error) {
+        console.error('加载定时任务失败:', error);
+        return [];
+    }
+}
+
+async function createScheduledTask(accountId, runHour, enabled = true) {
+    return fetchJSON(`${apiBase}/scheduled-tasks`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            account_id: accountId,
+            run_hour: runHour,
+            enabled,
+            random_delay_max: POLISH_SCHEDULE_RANDOM_MINUTES
+        })
+    });
+}
+
+async function updateScheduledTask(taskId, payload) {
+    return fetchJSON(`${apiBase}/scheduled-tasks/${taskId}`, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
+}
+
+function getPolishScheduledTask(tasks, accountId) {
+    const matchedTasks = tasks
+        .filter(task => task.account_id === accountId && task.task_type === 'item_polish')
+        .sort((a, b) => Number(Boolean(b.enabled)) - Number(Boolean(a.enabled)) || Number(b.id) - Number(a.id));
+
+    return matchedTasks[0] || null;
+}
+
+function formatPolishScheduleHour(hour) {
+    const safeHour = Number.isFinite(Number(hour)) ? Number(hour) : 0;
+    return `${String(safeHour).padStart(2, '0')}:00`;
+}
+
+function getPolishScheduleDescription(taskOrHour, randomDelayMax = POLISH_SCHEDULE_RANDOM_MINUTES) {
+    const runHour = typeof taskOrHour === 'object' && taskOrHour !== null
+        ? (taskOrHour.delay_minutes ?? taskOrHour.run_hour ?? 0)
+        : taskOrHour;
+    const safeRandomDelay = typeof taskOrHour === 'object' && taskOrHour !== null
+        ? (taskOrHour.random_delay_max ?? randomDelayMax)
+        : randomDelayMax;
+    return `每日 ${formatPolishScheduleHour(runHour)} 后随机 0-${safeRandomDelay} 分钟擦亮一次`;
+}
+
+function closePolishScheduleModal() {
+    const modalElement = document.getElementById('polishScheduleModal');
+    if (!modalElement) return;
+
+    const modalInstance = bootstrap.Modal.getInstance(modalElement);
+    if (modalInstance) {
+        modalInstance.hide();
+    } else {
+        modalElement.remove();
+    }
+}
+
+function refreshPolishScheduleModalState() {
+    const enabledInput = document.getElementById('polishScheduleEnabled');
+    const hourSelect = document.getElementById('polishScheduleHour');
+    const hint = document.getElementById('polishScheduleHint');
+
+    if (!enabledInput || !hourSelect || !hint) return;
+
+    const enabled = enabledInput.checked;
+    const runHour = parseInt(hourSelect.value, 10);
+
+    hint.className = `alert ${enabled ? 'alert-info' : 'alert-secondary'} py-2 mb-3`;
+    hint.textContent = enabled
+        ? getPolishScheduleDescription(runHour)
+        : `当前已关闭，保存后会记住 ${formatPolishScheduleHour(runHour)} 的设置，但不会自动执行`;
+}
+
+async function openPolishScheduleModal(accountId) {
+    try {
+        const tasks = await loadScheduledTasks();
+        const task = getPolishScheduledTask(tasks, accountId);
+        const runHour = Number.isFinite(Number(task?.delay_minutes)) ? Number(task.delay_minutes) : 8;
+        const enabled = task ? Boolean(task.enabled) : true;
+        const hourOptions = Array.from({ length: 24 }, (_, hour) => `
+            <option value="${hour}" ${hour === runHour ? 'selected' : ''}>${formatPolishScheduleHour(hour)}</option>
+        `).join('');
+        const statusText = task ? (task.enabled ? '已开启' : '未开启') : '保存后启用';
+        const nextRunText = task ? (task.enabled ? (task.next_run_at || '保存后生成') : '已关闭') : '保存后生成';
+        const lastRunText = task?.last_run_at || '暂无记录';
+
+        const existingModal = document.getElementById('polishScheduleModal');
+        if (existingModal) {
+            existingModal.remove();
+        }
+
+        const modalHtml = `
+            <div class="modal fade" id="polishScheduleModal" tabindex="-1" aria-labelledby="polishScheduleModalLabel" aria-hidden="true">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="polishScheduleModalLabel">
+                                <i class="bi bi-clock-history text-info me-2"></i>定时擦亮 - ${accountId}
+                            </h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <input type="hidden" id="polishScheduleAccountId" value="${accountId}">
+                            <input type="hidden" id="polishScheduleTaskId" value="${task ? task.id : ''}">
+
+                            <div class="form-check form-switch mb-3">
+                                <input class="form-check-input" type="checkbox" role="switch" id="polishScheduleEnabled" ${enabled ? 'checked' : ''}>
+                                <label class="form-check-label" for="polishScheduleEnabled">启用每日定时擦亮</label>
+                            </div>
+
+                            <div class="mb-3">
+                                <label class="form-label" for="polishScheduleHour">每日几点开始擦亮</label>
+                                <select class="form-select" id="polishScheduleHour">
+                                    ${hourOptions}
+                                </select>
+                            </div>
+
+                            <div class="alert alert-info py-2 mb-3" id="polishScheduleHint">
+                                ${getPolishScheduleDescription(runHour)}
+                            </div>
+
+                            <div class="small text-muted">
+                                <div>当前状态：${statusText}</div>
+                                <div>下次执行：${nextRunText}</div>
+                                <div>上次执行：${lastRunText}</div>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                            <button type="button" class="btn btn-primary" onclick="savePolishSchedule()">保存设置</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.insertAdjacentHTML('beforeend', modalHtml);
+
+        const modalElement = document.getElementById('polishScheduleModal');
+        const modalInstance = new bootstrap.Modal(modalElement);
+        modalElement.addEventListener('hidden.bs.modal', function () {
+            modalElement.remove();
+        });
+
+        document.getElementById('polishScheduleEnabled').addEventListener('change', refreshPolishScheduleModalState);
+        document.getElementById('polishScheduleHour').addEventListener('change', refreshPolishScheduleModalState);
+        refreshPolishScheduleModalState();
+
+        modalInstance.show();
+    } catch (error) {
+        console.error('打开定时擦亮设置失败:', error);
+    }
+}
+
+async function savePolishSchedule() {
+    const accountId = document.getElementById('polishScheduleAccountId')?.value;
+    const taskId = parseInt(document.getElementById('polishScheduleTaskId')?.value || '', 10);
+    const enabled = document.getElementById('polishScheduleEnabled')?.checked;
+    const runHour = parseInt(document.getElementById('polishScheduleHour')?.value || '', 10);
+
+    if (!accountId) {
+        showToast('缺少账号ID', 'warning');
+        return;
+    }
+
+    if (!Number.isInteger(runHour) || runHour < 0 || runHour > 23) {
+        showToast('请选择有效的擦亮时间', 'warning');
+        return;
+    }
+
+    try {
+        let data;
+
+        if (taskId) {
+            data = await updateScheduledTask(taskId, {
+                run_hour: runHour,
+                enabled,
+                random_delay_max: POLISH_SCHEDULE_RANDOM_MINUTES
+            });
+        } else {
+            data = await createScheduledTask(accountId, runHour, enabled);
+        }
+
+        if (!data.success) {
+            showToast(`保存失败: ${data.message || '未知错误'}`, 'danger');
+            return;
+        }
+
+        const successMessage = enabled
+            ? `${accountId} 已设置为 ${getPolishScheduleDescription(runHour)}`
+            : `${accountId} 已保存 ${formatPolishScheduleHour(runHour)} 的定时擦亮时间，当前为关闭状态`;
+        showToast(successMessage, 'success');
+        closePolishScheduleModal();
+    } catch (error) {
+        console.error('保存定时擦亮设置失败:', error);
     }
 }

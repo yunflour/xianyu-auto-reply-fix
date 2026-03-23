@@ -2841,8 +2841,10 @@ class XianyuLive:
         if not normalized_text:
             return None
 
+        direct_match_found = False
         direct_match = re.search(r'updateKey["\']?\s*[:=]\s*["\']([^"\']+)', normalized_text)
         if direct_match:
+            direct_match_found = True
             normalized_text = direct_match.group(1)
 
         colon_parts = [part.strip().strip('"\'') for part in normalized_text.split(':')]
@@ -2850,9 +2852,10 @@ class XianyuLive:
         if long_numeric_parts:
             return long_numeric_parts[0]
 
-        generic_matches = re.findall(r'\d{16,}', normalized_text)
-        if generic_matches:
-            return generic_matches[0]
+        if direct_match_found:
+            generic_matches = re.findall(r'\d{16,}', normalized_text)
+            if generic_matches:
+                return generic_matches[0]
         return None
 
     def _extract_order_id_from_candidate_text(self, raw_text: Any, source: str = '') -> Optional[str]:
@@ -2877,7 +2880,6 @@ class XianyuLive:
         text_lower = normalized_text.lower()
         if (
             'updatekey' in source_lower
-            or 'extjson' in source_lower
             or 'updatekey' in text_lower
             or ('trade_' in text_lower and ':' in normalized_text)
             or ('buyer_confirm' in text_lower and ':' in normalized_text)
@@ -7373,6 +7375,7 @@ Cookie数量: {cookie_count}
                             return None
 
                     # 获取解析后的规格信息
+                    spec_parse_mode = str(result.get('spec_parse_mode') or '').strip() or 'no_spec'
                     spec_name = _normalize_optional_text(result.get('spec_name'))
                     spec_value = _normalize_optional_text(result.get('spec_value'))
                     spec_name_2 = _normalize_optional_text(result.get('spec_name_2'))
@@ -7399,6 +7402,14 @@ Cookie数量: {cookie_count}
                         spec_value = None
                         spec_name_2 = None
                         spec_value_2 = None
+
+                    if spec_parse_mode == 'one_spec' and spec_name and spec_value and not (spec_name_2 or spec_value_2):
+                        spec_name_2 = ''
+                        spec_value_2 = ''
+                        logger.info(
+                            f"【{self.cookie_id}】订单详情明确解析为单规格，允许清空历史残留的第二规格字段: "
+                            f"order_id={order_id}, item_id={item_id}, spec={spec_name}:{spec_value}"
+                        )
 
                     # 获取订单状态（从闲鱼页面解析）
                     raw_order_status = _normalize_optional_text(result.get('order_status'))
@@ -12724,6 +12735,26 @@ Cookie数量: {cookie_count}
             "total_saved": total_saved,
             "items": all_items
         }
+
+    def _get_item_polish_module(self):
+        if os.getenv('ITEM_POLISH_IMPL', '').strip().lower() == 'plain':
+            from item_polish_module import ItemPolishModule
+        else:
+            from secure_item_polish_ultra import ItemPolishModule
+
+        return ItemPolishModule(self)
+
+    async def polish_item(self, item_id, retry_count=0):
+        """擦亮单个商品。"""
+        return await self._get_item_polish_module().polish_item(item_id, retry_count)
+
+    async def _polish_item_backup(self, item_id):
+        """使用备用API擦亮商品。"""
+        return await self._get_item_polish_module()._polish_item_backup(item_id)
+
+    async def polish_all_items(self):
+        """擦亮所有在售商品。"""
+        return await self._get_item_polish_module().polish_all_items()
 
     async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
         """发送图片消息"""
