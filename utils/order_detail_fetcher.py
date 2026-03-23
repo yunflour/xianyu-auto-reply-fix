@@ -79,15 +79,20 @@ class OrderDetailFetcher:
 
     # 类级别的锁字典，为每个order_id维护一个锁
     _order_locks = defaultdict(lambda: asyncio.Lock())
+    _order_lock_last_access: Dict[str, float] = {}
+    _order_lock_guard = Lock()
+    _order_lock_cleanup_ttl = 300
 
     def __init__(self, cookie_string: str = None, headless: bool = True, cookie_id_for_log: str = "unknown"):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self._playwright = None
         self.headless = headless  # 保存headless设置
         self.cookie_id_for_log = cookie_id_for_log or "unknown"
         self._last_order_status_source = 'unknown'
         self._active_order_id = ''
+        self._active_capture_token = 0
         self._captured_amount_candidates: List[Dict[str, Any]] = []
         self._captured_sku_candidates: List[Dict[str, Any]] = []
         self._pending_response_tasks = set()
@@ -113,6 +118,42 @@ class OrderDetailFetcher:
         # Cookie配置 - 支持动态传入
         self.cookie = cookie_string
 
+    def _touch_order_lock(self, order_id: str) -> None:
+        order_id_text = str(order_id or '').strip()
+        if not order_id_text:
+            return
+
+        with self._order_lock_guard:
+            self._order_lock_last_access[order_id_text] = time.time()
+
+    def _cleanup_stale_order_locks(self) -> None:
+        now = time.time()
+        stale_order_ids = []
+
+        with self._order_lock_guard:
+            for order_id, last_access in list(self._order_lock_last_access.items()):
+                lock = self._order_locks.get(order_id)
+                if lock is None:
+                    self._order_lock_last_access.pop(order_id, None)
+                    continue
+                if now - last_access < self._order_lock_cleanup_ttl:
+                    continue
+                if lock.locked():
+                    continue
+                stale_order_ids.append(order_id)
+
+            for order_id in stale_order_ids:
+                self._order_locks.pop(order_id, None)
+                self._order_lock_last_access.pop(order_id, None)
+
+    def _get_order_lock(self, order_id: str) -> asyncio.Lock:
+        self._cleanup_stale_order_locks()
+        order_id_text = str(order_id or '').strip()
+        with self._order_lock_guard:
+            order_lock = self._order_locks[order_id_text]
+            self._order_lock_last_access[order_id_text] = time.time()
+            return order_lock
+
     async def init_browser(self, headless: bool = None):
         """初始化浏览器"""
         try:
@@ -122,7 +163,7 @@ class OrderDetailFetcher:
 
             logger.info(f"开始初始化浏览器，headless模式: {headless}")
 
-            playwright = await async_playwright().start()
+            self._playwright = await async_playwright().start()
 
             # 启动浏览器（Docker环境优化）
             browser_args = [
@@ -184,7 +225,7 @@ class OrderDetailFetcher:
                 ])
 
             logger.info(f"启动浏览器，参数: {browser_args}")
-            self.browser = await playwright.chromium.launch(
+            self.browser = await self._playwright.chromium.launch(
                 headless=headless,
                 args=browser_args
             )
@@ -257,12 +298,13 @@ class OrderDetailFetcher:
             包含订单详情的字典，失败时返回None
         """
         # 获取该订单ID的锁
-        order_lock = self._order_locks[order_id]
+        order_lock = self._get_order_lock(order_id)
 
         async with order_lock:
             logger.info(f"🔒 获取订单 {order_id} 的锁，开始处理...")
 
             try:
+                self._touch_order_lock(order_id)
                 # 如果不是强制刷新，先查询数据库缓存
                 if not force_refresh:
                     from db_manager import db_manager
@@ -466,12 +508,15 @@ class OrderDetailFetcher:
                                     if retry_quantity == quantity_int:
                                         logger.info(f"二次确认数量一致: {quantity_int}，确认为多数量订单")
                                     else:
-                                        # 两次不一致，使用较小的值
-                                        final_qty = min(quantity_int, retry_quantity)
-                                        logger.warning(f"数量校验不一致: 第一次={quantity_int}, 第二次={retry_quantity}，使用较小值: {final_qty}")
-                                        sku_info['quantity'] = str(final_qty)
+                                        logger.warning(
+                                            f"数量校验不一致，保留第一次结果并标记数量不可信: 第一次={quantity_int}, 第二次={retry_quantity}"
+                                        )
+                                else:
+                                    logger.warning(f"数量二次确认缺失，保留第一次结果: {quantity_int}")
                         except Exception as verify_e:
-                            logger.warning(f"数量校验失败，使用原始值: {verify_e}")
+                            logger.warning(f"数量二次确认异常，保留第一次结果: {verify_e}")
+
+                    self._touch_order_lock(order_id)
 
                     result = {
                         'order_id': order_id,
@@ -632,6 +677,33 @@ class OrderDetailFetcher:
 
     def _reset_amount_capture(self, order_id: str) -> None:
         self._active_order_id = str(order_id or '').strip()
+        self._active_capture_token += 1
+        self._captured_amount_candidates = []
+        self._captured_sku_candidates = []
+        self._pending_response_tasks = set()
+
+    def _is_capture_token_active(self, order_id: str, capture_token: int) -> bool:
+        return (
+            str(order_id or '').strip() == self._active_order_id and
+            capture_token == self._active_capture_token
+        )
+
+    async def _cancel_pending_response_capture_tasks(self) -> None:
+        if not self._pending_response_tasks:
+            return
+
+        pending_tasks = list(self._pending_response_tasks)
+        for task in pending_tasks:
+            if not task.done():
+                task.cancel()
+
+        try:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.debug(f"取消订单详情响应解析任务失败: {e}")
+
+    def _clear_amount_capture_state(self) -> None:
+        self._active_order_id = ''
         self._captured_amount_candidates = []
         self._captured_sku_candidates = []
         self._pending_response_tasks = set()
@@ -658,6 +730,7 @@ class OrderDetailFetcher:
             return
 
         current_order_id = self._active_order_id
+        current_capture_token = self._active_capture_token
 
         def _on_task_done(task: asyncio.Task) -> None:
             self._pending_response_tasks.discard(task)
@@ -670,7 +743,7 @@ class OrderDetailFetcher:
 
         def _response_handler(response) -> None:
             try:
-                task = asyncio.create_task(self._process_order_detail_response(response, current_order_id))
+                task = asyncio.create_task(self._process_order_detail_response(response, current_order_id, current_capture_token))
             except Exception as e:
                 logger.debug(f"创建订单详情响应解析任务失败: {e}")
                 return
@@ -686,7 +759,11 @@ class OrderDetailFetcher:
             return
 
         try:
-            await asyncio.wait(list(self._pending_response_tasks), timeout=timeout)
+            done, pending = await asyncio.wait(list(self._pending_response_tasks), timeout=timeout)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         except Exception as e:
             logger.debug(f"等待订单详情响应解析任务失败: {e}")
 
@@ -1029,7 +1106,7 @@ class OrderDetailFetcher:
 
         return candidates
 
-    async def _process_order_detail_response(self, response, order_id: str) -> None:
+    async def _process_order_detail_response(self, response, order_id: str, capture_token: int) -> None:
         try:
             if not response or response.status != 200:
                 return
@@ -1061,8 +1138,13 @@ class OrderDetailFetcher:
             if payload is None or not self._payload_references_order(payload, order_id, url):
                 return
 
+            if not self._is_capture_token_active(order_id, capture_token):
+                return
+
             response_candidates = self._extract_amount_candidates_from_payload(payload, path=f"response[{url.split('?')[0]}]")
             for candidate in response_candidates:
+                if not self._is_capture_token_active(order_id, capture_token):
+                    return
                 candidate_copy = dict(candidate)
                 candidate_copy['source'] = f"structured_response::{candidate['source']}"
                 candidate_copy['response_url'] = url
@@ -1076,6 +1158,8 @@ class OrderDetailFetcher:
                 )
 
             sku_candidates = self._extract_sku_candidates_from_payload(payload, path=f"response[{url.split('?')[0]}]")
+            if not self._is_capture_token_active(order_id, capture_token):
+                return
             self._captured_sku_candidates.extend(sku_candidates)
             if sku_candidates:
                 best_sku_candidate = max(sku_candidates, key=lambda item: item.get('score', 0))
@@ -2303,6 +2387,7 @@ class OrderDetailFetcher:
         """强制关闭浏览器，忽略所有错误"""
         try:
             self._clear_response_capture_handler()
+            await self._cancel_pending_response_capture_tasks()
             if self.page:
                 try:
                     await self.page.close()
@@ -2324,7 +2409,14 @@ class OrderDetailFetcher:
                     pass
                 self.browser = None
 
-            self._active_order_id = ''
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+
+            self._clear_amount_capture_state()
 
         except Exception as e:
             logger.debug(f"强制关闭浏览器过程中的异常（可忽略）: {e}")
@@ -2334,13 +2426,20 @@ class OrderDetailFetcher:
         try:
             await self._wait_for_response_capture_tasks(timeout=0.2)
             self._clear_response_capture_handler()
+            await self._cancel_pending_response_capture_tasks()
             if self.page:
                 await self.page.close()
+                self.page = None
             if self.context:
                 await self.context.close()
+                self.context = None
             if self.browser:
                 await self.browser.close()
-            self._active_order_id = ''
+                self.browser = None
+            if self._playwright:
+                await self._playwright.stop()
+                self._playwright = None
+            self._clear_amount_capture_state()
             logger.info("浏览器已关闭")
         except Exception as e:
             logger.error(f"关闭浏览器失败: {e}")

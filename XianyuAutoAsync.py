@@ -9288,10 +9288,19 @@ Cookie数量: {cookie_count}
 
                 # 暂时暂停心跳任务，避免与浏览器操作冲突
                 heartbeat_was_running = False
-                if self.heartbeat_task and not self.heartbeat_task.done():
+                old_heartbeat_task = self.heartbeat_task
+                if old_heartbeat_task and not old_heartbeat_task.done():
                     heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
+                    old_heartbeat_task.cancel()
                     logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
+                    logger.info(f"【{self.cookie_id}】等待心跳任务响应取消信号...")
+                    try:
+                        await old_heartbeat_task
+                    except asyncio.CancelledError:
+                        logger.info(f"【{self.cookie_id}】✅ 心跳任务已成功取消")
+
+                if self.heartbeat_task is old_heartbeat_task:
+                    self.heartbeat_task = None
 
                 # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
                 success = await asyncio.wait_for(
@@ -9300,7 +9309,8 @@ Cookie数量: {cookie_count}
                 )
 
                 # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
+                if (heartbeat_was_running and self.ws and not self.ws.closed and
+                    (not self.heartbeat_task or self.heartbeat_task.done())):
                     logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
                     self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 

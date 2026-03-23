@@ -25,7 +25,10 @@ class AIReplyEngine:
         self._init_default_prompts()
         # 用于控制同一chat_id消息的串行处理
         self._chat_locks = {}
+        self._chat_lock_last_access = {}
         self._chat_locks_lock = threading.Lock()
+        self._chat_lock_expire_seconds = 600
+        self._chat_lock_last_cleanup = 0.0
     
     def _init_default_prompts(self):
         """初始化默认提示词（用于构建统一提示词）"""
@@ -460,11 +463,31 @@ class AIReplyEngine:
         settings = db_manager.get_ai_reply_settings(cookie_id)
         return settings['ai_enabled']
     
+    def _cleanup_chat_locks(self, now: float):
+        """清理长时间未访问且当前未锁定的chat锁"""
+        if now - self._chat_lock_last_cleanup < 60:
+            return
+
+        expired_chat_ids = []
+        for chat_id, lock in self._chat_locks.items():
+            last_access = self._chat_lock_last_access.get(chat_id, 0.0)
+            if now - last_access > self._chat_lock_expire_seconds and not lock.locked():
+                expired_chat_ids.append(chat_id)
+
+        for chat_id in expired_chat_ids:
+            self._chat_locks.pop(chat_id, None)
+            self._chat_lock_last_access.pop(chat_id, None)
+
+        self._chat_lock_last_cleanup = now
+
     def _get_chat_lock(self, chat_id: str) -> threading.Lock:
         """获取指定chat_id的锁，如果不存在则创建"""
+        now = time.time()
         with self._chat_locks_lock:
+            self._cleanup_chat_locks(now)
             if chat_id not in self._chat_locks:
                 self._chat_locks[chat_id] = threading.Lock()
+            self._chat_lock_last_access[chat_id] = now
             return self._chat_locks[chat_id]
     
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
@@ -480,9 +503,10 @@ class AIReplyEngine:
         
         try:
             # 先保存用户消息到数据库（意图暂时设为None，后续可根据需要更新）
-            message_created_at = self.save_conversation(
+            saved_message = self.save_conversation(
                 chat_id, cookie_id, user_id, item_id, "user", message, intent=None
             )
+            message_id = saved_message['id'] if saved_message else None
             
             # 消息去抖处理
             if not skip_wait:
@@ -501,7 +525,7 @@ class AIReplyEngine:
                 
                 if recent_messages and len(recent_messages) > 0:
                     latest_message = recent_messages[-1]
-                    if message_created_at != latest_message['created_at']:
+                    if message_id != latest_message['id']:
                         logger.info(f"【{cookie_id}】检测到更新消息，跳过当前消息")
                         return None
                 
@@ -645,26 +669,26 @@ class AIReplyEngine:
             logger.error(f"获取对话上下文失败: {e}")
             return []
     
-    def save_conversation(self, chat_id: str, cookie_id: str, user_id: str, 
-                         item_id: str, role: str, content: str, intent: str = None) -> Optional[str]:
-        """保存对话记录，返回创建时间"""
+    def save_conversation(self, chat_id: str, cookie_id: str, user_id: str,
+                         item_id: str, role: str, content: str, intent: str = None) -> Optional[Dict]:
+        """保存对话记录，返回刚插入记录的id和创建时间"""
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 cursor.execute('''
-                INSERT INTO ai_conversations 
+                INSERT INTO ai_conversations
                 (cookie_id, chat_id, user_id, item_id, role, content, intent)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (cookie_id, chat_id, user_id, item_id, role, content, intent))
+                inserted_id = cursor.lastrowid
                 db_manager.conn.commit()
-                
-                # 获取刚插入记录的created_at
+
                 cursor.execute('''
-                SELECT created_at FROM ai_conversations 
-                WHERE rowid = last_insert_rowid()
-                ''')
+                SELECT id, created_at FROM ai_conversations
+                WHERE id = ?
+                ''', (inserted_id,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return {"id": result[0], "created_at": result[1]} if result else None
         except Exception as e:
             logger.error(f"保存对话记录失败: {e}")
             return None
@@ -685,33 +709,33 @@ class AIReplyEngine:
             return 0
     
     def _get_recent_user_messages(self, chat_id: str, cookie_id: str, seconds: int = 2) -> List[Dict]:
-        """获取最近seconds秒内的所有用户消息（包含内容和时间戳）"""
+        """获取最近seconds秒内的所有用户消息（包含id、内容和时间戳）"""
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
                 # 先查询所有该chat的user消息，用于调试
                 cursor.execute('''
-                SELECT content, created_at, 
+                SELECT id, content, created_at,
                        julianday('now') - julianday(created_at) as time_diff_days,
                        (julianday('now') - julianday(created_at)) * 86400.0 as time_diff_seconds
-                FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND role = 'user' 
-                ORDER BY created_at DESC LIMIT 10
+                FROM ai_conversations
+                WHERE chat_id = ? AND cookie_id = ? AND role = 'user'
+                ORDER BY created_at DESC, id DESC LIMIT 10
                 ''', (chat_id, cookie_id))
-                
+
                 all_messages = cursor.fetchall()
-                logger.info(f"【调试】chat_id={chat_id} 最近10条user消息: {[(msg[0][:10], msg[1], f'{msg[3]:.2f}秒前') for msg in all_messages]}")
-                
+                logger.info(f"【调试】chat_id={chat_id} 最近10条user消息: {[(msg[0], msg[1][:10], msg[2], f'{msg[4]:.2f}秒前') for msg in all_messages]}")
+
                 # 正式查询
                 cursor.execute('''
-                SELECT content, created_at FROM ai_conversations 
-                WHERE chat_id = ? AND cookie_id = ? AND role = 'user' 
+                SELECT id, content, created_at FROM ai_conversations
+                WHERE chat_id = ? AND cookie_id = ? AND role = 'user'
                 AND julianday('now') - julianday(created_at) < (? / 86400.0)
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, id ASC
                 ''', (chat_id, cookie_id, seconds))
-                
+
                 results = cursor.fetchall()
-                return [{"content": row[0], "created_at": row[1]} for row in results]
+                return [{"id": row[0], "content": row[1], "created_at": row[2]} for row in results]
         except Exception as e:
             logger.error(f"获取最近用户消息列表失败: {e}")
             return []
