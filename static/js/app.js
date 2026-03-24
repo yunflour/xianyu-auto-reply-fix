@@ -10713,7 +10713,7 @@ function showPasswordLoginQRCode(verificationUrl, screenshotPath) {
     if (screenshotPath) {
         // 显示截图
         if (screenshotImg) {
-            screenshotImg.src = `/${screenshotPath}?t=${new Date().getTime()}`;
+            screenshotImg.src = `${normalizeStaticAssetPath(screenshotPath)}?t=${new Date().getTime()}`;
             screenshotImg.style.display = 'block';
         }
         
@@ -10865,6 +10865,31 @@ function resetPasswordLoginForm() {
 
 let qrCodeCheckInterval = null;
 let qrCodeSessionId = null;
+let qrCodeVerificationState = {
+    renderKey: '',
+    toastShown: false,
+    inFlight: false,
+    completed: false,
+    activeSessionId: null
+};
+
+function normalizeStaticAssetPath(path) {
+    if (!path) {
+        return '';
+    }
+    if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) {
+        return path;
+    }
+    return path.startsWith('/') ? path : `/${path}`;
+}
+
+function resetQRCodeVerificationState() {
+    qrCodeVerificationState.renderKey = '';
+    qrCodeVerificationState.toastShown = false;
+    qrCodeVerificationState.inFlight = false;
+    qrCodeVerificationState.completed = false;
+    qrCodeVerificationState.activeSessionId = null;
+}
 
 // 显示扫码登录模态框
 function showQRCodeLogin() {
@@ -10890,6 +10915,7 @@ async function refreshQRCode() {
 // 生成二维码
 async function generateQRCode() {
     try {
+    resetQRCodeVerificationState();
     showQRCodeLoading();
 
     const response = await fetch(`${apiBase}/qr-login/generate`, {
@@ -10904,6 +10930,7 @@ async function generateQRCode() {
         const data = await response.json();
         if (data.success) {
         qrCodeSessionId = data.session_id;
+        qrCodeVerificationState.activeSessionId = data.session_id;
         showQRCodeImage(data.qr_code_url);
         startQRCodeCheck();
         } else {
@@ -10920,6 +10947,7 @@ async function generateQRCode() {
 
 // 显示二维码加载状态
 function showQRCodeLoading() {
+    resetQRCodeVerificationState();
     document.getElementById('qrCodeContainer').style.display = 'block';
     document.getElementById('qrCodeImage').style.display = 'none';
     document.getElementById('statusText').textContent = '正在生成二维码，请耐心等待...';
@@ -10968,17 +10996,28 @@ function startQRCodeCheck() {
 
 // 检查二维码状态
 async function checkQRCodeStatus() {
-    if (!qrCodeSessionId) return;
+    if (!qrCodeSessionId || qrCodeVerificationState.inFlight || qrCodeVerificationState.completed) return;
+
+    const requestSessionId = qrCodeSessionId;
+    qrCodeVerificationState.inFlight = true;
 
     try {
-    const response = await fetch(`${apiBase}/qr-login/check/${qrCodeSessionId}`, {
+    const response = await fetch(`${apiBase}/qr-login/check/${requestSessionId}`, {
         headers: {
         'Authorization': `Bearer ${authToken}`
         }
     });
 
+    if (requestSessionId !== qrCodeVerificationState.activeSessionId || qrCodeVerificationState.completed) {
+        return;
+    }
+
     if (response.ok) {
         const data = await response.json();
+
+        if (requestSessionId !== qrCodeVerificationState.activeSessionId || qrCodeVerificationState.completed) {
+        return;
+        }
 
         switch (data.status) {
         case 'waiting':
@@ -10988,6 +11027,7 @@ async function checkQRCodeStatus() {
             document.getElementById('statusText').textContent = '已扫码，请在手机上确认...';
             break;
         case 'success':
+            qrCodeVerificationState.completed = true;
             document.getElementById('statusText').textContent = '登录成功！';
             document.getElementById('statusSpinner').style.display = 'none';
             clearQRCodeCheck();
@@ -11005,9 +11045,8 @@ async function checkQRCodeStatus() {
             clearQRCodeCheck();
             break;
         case 'verification_required':
-            document.getElementById('statusText').textContent = '需要手机验证';
-            document.getElementById('statusSpinner').style.display = 'none';
-            clearQRCodeCheck();
+            document.getElementById('statusText').textContent = '需要闲鱼验证，系统正在等待验证完成...';
+            document.getElementById('statusSpinner').style.display = 'inline-block';
             showVerificationRequired(data);
             break;
         case 'processing':
@@ -11015,6 +11054,7 @@ async function checkQRCodeStatus() {
             // 继续轮询，不清理检查
             break;
         case 'already_processed':
+            qrCodeVerificationState.completed = true;
             document.getElementById('statusText').textContent = '登录已完成';
             document.getElementById('statusSpinner').style.display = 'none';
             clearQRCodeCheck();
@@ -11024,45 +11064,100 @@ async function checkQRCodeStatus() {
     }
     } catch (error) {
     console.error('检查二维码状态失败:', error);
+    } finally {
+    qrCodeVerificationState.inFlight = false;
     }
 }
 
 // 显示需要验证的提示
 function showVerificationRequired(data) {
-    if (data.verification_url) {
+    const screenshotPath = data.screenshot_path || '';
+    const verificationUrl = data.verification_url || '';
+    const renderKey = `${screenshotPath}|${verificationUrl}`;
+    if (qrCodeVerificationState.renderKey === renderKey && renderKey) {
+    return;
+    }
+    qrCodeVerificationState.renderKey = renderKey;
+
     // 隐藏二维码区域
     document.getElementById('qrCodeContainer').style.display = 'none';
     document.getElementById('qrCodeImage').style.display = 'none';
 
-    // 显示验证提示
-    const verificationHtml = `
+    let verificationHtml = `
         <div class="text-center">
         <div class="mb-4">
             <i class="bi bi-shield-exclamation text-warning" style="font-size: 4rem;"></i>
         </div>
-        <h5 class="text-warning mb-3">账号需要手机验证</h5>
+        <h5 class="text-warning mb-3">账号需要闲鱼验证</h5>
         <div class="alert alert-warning border-0 mb-4">
             <i class="bi bi-info-circle me-2"></i>
-            <strong>检测到账号存在风控，需要进行手机验证才能完成登录</strong>
-        </div>
-        <div class="mb-4">
-            <p class="text-muted mb-3">请点击下方按钮，在新窗口中完成手机验证：</p>
-            <a href="${data.verification_url}" target="_blank" class="btn btn-warning btn-lg">
-            <i class="bi bi-phone me-2"></i>
-            打开手机验证页面
-            </a>
+            <strong>检测到账号存在风控，系统已在服务端保持原始会话并等待验证完成</strong>
         </div>
         <div class="alert alert-info border-0">
             <i class="bi bi-lightbulb me-2"></i>
             <small>
             <strong>验证步骤：</strong><br>
-            1. 点击上方按钮打开验证页面<br>
-            2. 按照页面提示完成手机验证<br>
-            3. 验证完成后，重新扫码登录
+            1. 使用手机闲鱼 APP 扫描下方二维码并完成验证<br>
+            2. 保持当前弹窗打开，系统会自动继续登录流程<br>
+            3. 如果二维码暂未出现，请稍等几秒，页面会自动刷新显示
             </small>
         </div>
         </div>
     `;
+
+    if (screenshotPath) {
+    verificationHtml = `
+        <div class="text-center">
+        <div class="mb-4">
+            <i class="bi bi-shield-exclamation text-warning" style="font-size: 4rem;"></i>
+        </div>
+        <h5 class="text-warning mb-3">账号需要闲鱼验证</h5>
+        <div class="alert alert-warning border-0 mb-4">
+            <i class="bi bi-info-circle me-2"></i>
+            <strong>检测到账号存在风控，系统已在服务端保持原始会话并生成验证二维码</strong>
+        </div>
+        <div class="mb-4">
+            <p class="text-muted mb-3">请使用手机闲鱼 APP 扫描下方二维码完成验证：</p>
+            <img src="${normalizeStaticAssetPath(screenshotPath)}?t=${Date.now()}" alt="闲鱼验证二维码" class="img-fluid rounded border" style="max-width: 360px; width: 100%; height: auto;">
+        </div>
+        <div class="alert alert-info border-0">
+            <i class="bi bi-lightbulb me-2"></i>
+            <small>
+            <strong>验证步骤：</strong><br>
+            1. 使用手机闲鱼 APP 扫描上方二维码并完成验证<br>
+            2. 保持当前弹窗打开，系统会自动继续登录流程<br>
+            3. 如果二维码失效，请关闭弹窗后重新发起扫码登录
+            </small>
+        </div>
+        </div>
+    `;
+    } else if (verificationUrl) {
+    verificationHtml = `
+        <div class="text-center">
+        <div class="mb-4">
+            <i class="bi bi-shield-exclamation text-warning" style="font-size: 4rem;"></i>
+        </div>
+        <h5 class="text-warning mb-3">账号需要闲鱼验证</h5>
+        <div class="alert alert-warning border-0 mb-4">
+            <i class="bi bi-info-circle me-2"></i>
+            <strong>系统正在准备验证二维码，当前先保留一个兜底链接</strong>
+        </div>
+        <div class="mb-4">
+            <p class="text-muted mb-3">二维码通常会自动出现；如果长时间未出现，可尝试使用兜底入口：</p>
+            <a href="${verificationUrl}" target="_blank" class="btn btn-outline-warning">
+            <i class="bi bi-box-arrow-up-right me-2"></i>
+            打开兜底验证页面
+            </a>
+        </div>
+        <div class="alert alert-info border-0">
+            <i class="bi bi-lightbulb me-2"></i>
+            <small>
+            系统仍会继续尝试在当前会话中生成二维码并自动完成后续登录。
+            </small>
+        </div>
+        </div>
+    `;
+    }
 
     // 创建验证提示容器
     let verificationContainer = document.getElementById('verificationContainer');
@@ -11076,14 +11171,25 @@ function showVerificationRequired(data) {
     verificationContainer.style.display = 'block';
 
     // 显示Toast提示
-    showToast('账号需要手机验证，请按照提示完成验证', 'warning');
+    if (!qrCodeVerificationState.toastShown) {
+    showToast('账号需要闲鱼验证，请使用当前页面展示的二维码完成验证', 'warning');
+    qrCodeVerificationState.toastShown = true;
     }
 }
 
 // 处理扫码成功
 function handleQRCodeSuccess(data) {
     if (data.account_info) {
-    const { account_id, is_new_account, real_cookie_refreshed, fallback_reason, cookie_length } = data.account_info;
+    const {
+        account_id,
+        is_new_account,
+        real_cookie_refreshed,
+        fallback_reason,
+        cookie_length,
+        token_prewarmed,
+        task_restarted,
+        warning_message
+    } = data.account_info;
 
     // 构建成功消息
     let successMessage = '';
@@ -11100,9 +11206,18 @@ function handleQRCodeSuccess(data) {
 
     // 添加真实cookie获取状态信息
     if (real_cookie_refreshed === true) {
+        if (token_prewarmed === false || task_restarted === false) {
+        successMessage += '\n✅ 真实Cookie已获取';
+        if (warning_message) {
+            successMessage += `\n⚠️ ${warning_message}`;
+        }
+        document.getElementById('statusText').textContent = '登录完成，但账号任务尚未切换';
+        showToast(successMessage, 'warning');
+        } else {
         successMessage += '\n✅ 真实Cookie获取并保存成功';
         document.getElementById('statusText').textContent = '登录成功！真实Cookie已获取并保存';
         showToast(successMessage, 'success');
+        }
     } else if (real_cookie_refreshed === false) {
         successMessage += '\n⚠️ 真实Cookie获取失败，已保存原始扫码Cookie';
         if (fallback_reason) {
@@ -11134,6 +11249,7 @@ function clearQRCodeCheck() {
     qrCodeCheckInterval = null;
     }
     qrCodeSessionId = null;
+    resetQRCodeVerificationState();
 }
 
 // 刷新二维码
