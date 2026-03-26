@@ -12,7 +12,7 @@ import time
 import json
 import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
 import io
@@ -781,12 +781,44 @@ from loguru import logger
 logger.info("Web服务器启动，文件日志收集器已初始化")
 
 
+scheduled_task_checker_task = None
+
+
 # 启动定时任务调度器
 @app.on_event("startup")
 async def start_scheduled_task_checker():
     """应用启动时开启定时任务检查协程"""
-    asyncio.create_task(scheduled_task_checker())
+    global scheduled_task_checker_task
+
+    recovered_count = db_manager.reset_all_running_scheduled_tasks()
+    if recovered_count:
+        logger.warning(f"启动时清理了 {recovered_count} 个遗留 running 定时任务")
+
+    if scheduled_task_checker_task and not scheduled_task_checker_task.done():
+        logger.info("定时任务调度器已在运行，跳过重复启动")
+        return
+
+    scheduled_task_checker_task = asyncio.create_task(scheduled_task_checker())
     logger.info("定时任务调度器已启动")
+
+
+@app.on_event("shutdown")
+async def stop_scheduled_task_checker():
+    """应用关闭时停止定时任务检查协程"""
+    global scheduled_task_checker_task
+
+    if scheduled_task_checker_task and not scheduled_task_checker_task.done():
+        scheduled_task_checker_task.cancel()
+        try:
+            await scheduled_task_checker_task
+        except asyncio.CancelledError:
+            logger.info("定时任务调度器已停止")
+
+    reset_count = db_manager.reset_all_running_scheduled_tasks()
+    if reset_count:
+        logger.warning(f"关闭时清理了 {reset_count} 个遗留 running 定时任务")
+
+    scheduled_task_checker_task = None
 
 
 # 添加请求日志中间件
@@ -8920,30 +8952,70 @@ async def restart_application(current_user: Dict[str, Any] = Depends(get_current
 async def polish_account_items(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """擦亮指定账号的所有在售商品"""
     try:
-        cookie_info = db_manager.get_cookie_by_id(cid)
+        cookie_info, error_message = _get_owned_account_cookie_info(
+            cid,
+            current_user['user_id'],
+            bool(current_user.get('is_admin', False) or current_user.get('username') == ADMIN_USERNAME)
+        )
         if not cookie_info:
-            return {"success": False, "message": "未找到指定的账号信息"}
-
-        cookies_str = cookie_info.get('cookies_str', '')
-        if not cookies_str:
-            return {"success": False, "message": "账号cookie信息为空"}
-
-        from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cid)
+            return {"success": False, "message": error_message}
 
         logger.info(f"开始擦亮账号 {cid} 的所有商品")
-        result = await xianyu_instance.polish_all_items()
-
-        await xianyu_instance.close_session()
-
-        return result
+        return await _polish_items_with_instance_strategy(cid, cookie_info['cookies_str'])
 
     except Exception as e:
         logger.error(f"擦亮账号商品异常: {str(e)}")
         return {"success": False, "message": f"擦亮异常: {str(e)}"}
 
 
+
+
 # ==================== 定时任务管理API ====================
+
+def _get_owned_account_cookie_info(account_id: str, user_id: Optional[int] = None, is_admin: bool = False):
+    """获取账号 cookie 信息，并在需要时校验账号归属。"""
+    cookie_info = db_manager.get_cookie_details(account_id)
+    if not cookie_info:
+        return None, "未找到指定的账号信息"
+
+    if user_id is not None and not is_admin and cookie_info.get('user_id') != user_id:
+        return None, "无权操作此账号"
+
+    cookies_str = cookie_info.get('value', '')
+    if not cookies_str:
+        return None, "账号cookie信息为空"
+
+    return {
+        'id': cookie_info.get('id', account_id),
+        'user_id': cookie_info.get('user_id'),
+        'cookies_str': cookies_str,
+        'value': cookies_str,
+    }, None
+
+
+async def _polish_items_with_instance_strategy(account_id: str, cookies_str: str):
+    """优先复用在线实例，否则创建临时实例执行擦亮。"""
+    from XianyuAutoAsync import XianyuLive, ConnectionState
+
+    xianyu_instance = XianyuLive.get_instance(account_id)
+    created_temp_instance = False
+
+    if xianyu_instance is not None and xianyu_instance.connection_state == ConnectionState.CONNECTED and xianyu_instance.ws:
+        logger.info(f"擦亮账号 {account_id} 时复用在线实例")
+    else:
+        if xianyu_instance is not None:
+            logger.warning(f"账号 {account_id} 在线实例不可用，改为临时实例执行擦亮")
+        else:
+            logger.info(f"擦亮账号 {account_id} 时创建临时实例")
+        xianyu_instance = XianyuLive(cookies_str, account_id, register_global=False)
+        created_temp_instance = True
+
+    try:
+        return await xianyu_instance.polish_all_items()
+    finally:
+        if created_temp_instance:
+            await xianyu_instance.close_session()
+
 
 def _parse_enabled_flag(value):
     """将不同类型的 enabled 入参统一转换为 0/1"""
@@ -8980,6 +9052,14 @@ async def create_scheduled_task(request: dict, current_user: Dict[str, Any] = De
 
         if not account_id:
             return {"success": False, "message": "账号ID不能为空"}
+
+        cookie_info, error_message = _get_owned_account_cookie_info(
+            account_id,
+            current_user['user_id'],
+            bool(current_user.get('is_admin', False) or current_user.get('username') == ADMIN_USERNAME)
+        )
+        if not cookie_info:
+            return {"success": False, "message": error_message}
 
         name = f"每日擦亮-{account_id}"
         next_run_at = db_manager.calculate_next_daily_run(run_hour, random_delay_max, include_today=True)
@@ -9162,45 +9242,51 @@ async def scheduled_task_checker():
     """每60秒检查并执行到期的定时任务"""
     while True:
         try:
-            due_tasks = db_manager.get_due_tasks()
-            for task in due_tasks:
-                try:
-                    account_id = task['account_id']
-                    task_id = task['id']
-                    task_type = task['task_type']
+            stale_before = (datetime.now() - timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
+            recovered_count = db_manager.recover_stale_claimed_tasks(stale_before)
+            if recovered_count:
+                logger.warning(f"已回收 {recovered_count} 个过期 running 定时任务")
 
-                    logger.info(f"执行定时任务: {task['name']} (ID: {task_id}, 账号: {account_id})")
+            due_tasks = db_manager.get_due_tasks()
+            for due_task in due_tasks:
+                claimed_task = db_manager.claim_due_task(due_task['id'])
+                if not claimed_task:
+                    continue
+
+                task_id = claimed_task['id']
+                claim_token = claimed_task.get('claim_token')
+                account_id = claimed_task['account_id']
+                task_type = claimed_task['task_type']
+                run_hour = claimed_task.get('delay_minutes', 8)
+                random_max = claimed_task.get('random_delay_max', 10)
+                next_run_str = db_manager.calculate_next_daily_run(
+                    run_hour,
+                    random_max,
+                    include_today=False
+                )
+
+                try:
+                    logger.info(f"执行定时任务: {claimed_task['name']} (ID: {task_id}, 账号: {account_id})")
 
                     if task_type == 'item_polish':
-                        cookie_info = db_manager.get_cookie_by_id(account_id)
+                        cookie_info, error_message = _get_owned_account_cookie_info(account_id)
                         if not cookie_info:
-                            logger.warning(f"定时任务 {task_id} 账号 {account_id} 不存在，跳过")
-                            result = {"success": False, "message": "账号不存在"}
+                            logger.warning(f"定时任务 {task_id} 账号 {account_id} 无法执行: {error_message}")
+                            result = {"success": False, "message": error_message}
                         else:
-                            cookies_str = cookie_info.get('cookies_str', '')
-                            if not cookies_str:
-                                result = {"success": False, "message": "账号cookie为空"}
-                            else:
-                                from XianyuAutoAsync import XianyuLive
-                                xianyu_instance = XianyuLive(cookies_str, account_id)
-                                result = await xianyu_instance.polish_all_items()
-                                await xianyu_instance.close_session()
+                            result = await _polish_items_with_instance_strategy(account_id, cookie_info['cookies_str'])
                     else:
                         result = {"success": False, "message": f"未知任务类型: {task_type}"}
 
-                    run_hour = task.get('delay_minutes', 8)  # delay_minutes 复用为每日运行小时
-                    random_max = task.get('random_delay_max', 10)
-                    next_run_str = db_manager.calculate_next_daily_run(
-                        run_hour,
-                        random_max,
-                        include_today=False
-                    )
-
-                    db_manager.update_task_run_result(task_id, result, next_run_str)
+                    db_manager.finish_claimed_task(task_id, claim_token, result, next_run_str)
                     logger.info(f"定时任务 {task_id} 执行完毕，下次运行: {next_run_str}")
-
                 except Exception as e:
-                    logger.error(f"执行定时任务 {task.get('id')} 异常: {str(e)}")
+                    error_result = {"success": False, "message": f"执行异常: {str(e)}"}
+                    db_manager.fail_claimed_task(task_id, claim_token, error_result, next_run_str)
+                    logger.error(f"执行定时任务 {task_id} 异常: {str(e)}")
+        except asyncio.CancelledError:
+            logger.info("定时任务检查协程已取消")
+            raise
         except Exception as e:
             logger.error(f"定时任务检查异常: {str(e)}")
         await asyncio.sleep(60)

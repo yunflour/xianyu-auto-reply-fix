@@ -823,6 +823,9 @@ class DBManager:
                 next_run_at TEXT,
                 last_run_at TEXT,
                 last_run_result TEXT,
+                running INTEGER DEFAULT 0,
+                claimed_at TEXT,
+                claim_token TEXT,
                 user_id INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -1188,6 +1191,9 @@ Cookie数量: {cookie_count}
                 self.set_system_setting("db_version", "1.7", "数据库版本号")
                 logger.info("数据库升级到版本1.7完成")
 
+            # 升级定时任务表字段与索引
+            self.upgrade_scheduled_tasks_table_for_claim(cursor)
+
             # 迁移遗留数据（在所有版本升级完成后执行）
             self.migrate_legacy_data(cursor)
 
@@ -1195,6 +1201,34 @@ Cookie数量: {cookie_count}
             logger.error(f"数据库版本检查或升级失败: {e}")
             raise
             
+    def upgrade_scheduled_tasks_table_for_claim(self, cursor):
+        """为定时任务表补齐 claim/running 字段与索引"""
+        try:
+            scheduled_task_columns = set()
+            self._execute_sql(cursor, "PRAGMA table_info(scheduled_tasks)")
+            for column in cursor.fetchall():
+                if len(column) > 1:
+                    scheduled_task_columns.add(column[1])
+
+            if 'running' not in scheduled_task_columns:
+                self._execute_sql(cursor, "ALTER TABLE scheduled_tasks ADD COLUMN running INTEGER DEFAULT 0")
+                logger.info("为 scheduled_tasks 表添加 running 字段")
+            if 'claimed_at' not in scheduled_task_columns:
+                self._execute_sql(cursor, "ALTER TABLE scheduled_tasks ADD COLUMN claimed_at TEXT")
+                logger.info("为 scheduled_tasks 表添加 claimed_at 字段")
+            if 'claim_token' not in scheduled_task_columns:
+                self._execute_sql(cursor, "ALTER TABLE scheduled_tasks ADD COLUMN claim_token TEXT")
+                logger.info("为 scheduled_tasks 表添加 claim_token 字段")
+
+            self._execute_sql(cursor, "UPDATE scheduled_tasks SET running = 0 WHERE running IS NULL")
+            self._execute_sql(cursor, "UPDATE scheduled_tasks SET claimed_at = NULL WHERE claimed_at = ''")
+            self._execute_sql(cursor, "UPDATE scheduled_tasks SET claim_token = NULL WHERE claim_token = ''")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due_claim ON scheduled_tasks(enabled, running, next_run_at)")
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_claim_token ON scheduled_tasks(claim_token)")
+        except Exception as e:
+            logger.error(f"升级 scheduled_tasks 表失败: {e}")
+            raise
+
     def update_admin_user_id(self, cursor):
         """更新admin用户ID"""
         try:
@@ -8204,14 +8238,14 @@ Cookie数量: {cookie_count}
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                from datetime import datetime
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 self._execute_sql(cursor, """
                     SELECT id, name, task_type, account_id, enabled, interval_hours,
                            delay_minutes, random_delay_max, next_run_at, last_run_at,
-                           last_run_result, user_id, created_at, updated_at
+                           last_run_result, running, claimed_at, claim_token,
+                           user_id, created_at, updated_at
                     FROM scheduled_tasks
-                    WHERE enabled = 1 AND next_run_at <= ?
+                    WHERE enabled = 1 AND running = 0 AND next_run_at IS NOT NULL AND next_run_at <= ?
                     ORDER BY next_run_at ASC
                 """, (now,))
                 rows = cursor.fetchall()
@@ -8223,32 +8257,128 @@ Cookie数量: {cookie_count}
                         'interval_hours': row[5], 'delay_minutes': row[6],
                         'random_delay_max': row[7], 'next_run_at': row[8],
                         'last_run_at': row[9], 'last_run_result': row[10],
-                        'user_id': row[11], 'created_at': row[12], 'updated_at': row[13]
+                        'running': bool(row[11]), 'claimed_at': row[12], 'claim_token': row[13],
+                        'user_id': row[14], 'created_at': row[15], 'updated_at': row[16]
                     })
                 return tasks
             except Exception as e:
                 logger.error(f"获取到期任务失败: {e}")
                 return []
 
-    def update_task_run_result(self, task_id, result, next_run_at):
-        """更新任务执行结果和下次运行时间"""
+    def claim_due_task(self, task_id):
+        """尝试 claim 一个到期任务，成功时返回最新任务信息"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                from datetime import datetime
                 now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                claim_token = f"claim-{task_id}-{datetime.now().timestamp()}"
                 self._execute_sql(cursor, """
                     UPDATE scheduled_tasks
-                    SET last_run_at = ?, last_run_result = ?, next_run_at = ?, updated_at = CURRENT_TIMESTAMP
+                    SET running = 1, claimed_at = ?, claim_token = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND enabled = 1 AND running = 0 AND next_run_at IS NOT NULL AND next_run_at <= ?
+                """, (now, claim_token, task_id, now))
+                claimed = cursor.rowcount > 0
+                if not claimed:
+                    self.conn.rollback()
+                    return None
+
+                self._execute_sql(cursor, """
+                    SELECT id, name, task_type, account_id, enabled, interval_hours,
+                           delay_minutes, random_delay_max, next_run_at, last_run_at,
+                           last_run_result, running, claimed_at, claim_token,
+                           user_id, created_at, updated_at
+                    FROM scheduled_tasks
+                    WHERE id = ? AND claim_token = ?
+                """, (task_id, claim_token))
+                row = cursor.fetchone()
+                self.conn.commit()
+                if not row:
+                    return None
+                return {
+                    'id': row[0], 'name': row[1], 'task_type': row[2],
+                    'account_id': row[3], 'enabled': bool(row[4]),
+                    'interval_hours': row[5], 'delay_minutes': row[6],
+                    'random_delay_max': row[7], 'next_run_at': row[8],
+                    'last_run_at': row[9], 'last_run_result': row[10],
+                    'running': bool(row[11]), 'claimed_at': row[12], 'claim_token': row[13],
+                    'user_id': row[14], 'created_at': row[15], 'updated_at': row[16]
+                }
+            except Exception as e:
+                logger.error(f"claim 定时任务失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def finish_claimed_task(self, task_id, claim_token, result, next_run_at):
+        """完成已 claim 的任务并清理运行状态"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                params = [now, result_str, next_run_at, task_id]
+                sql = """
+                    UPDATE scheduled_tasks
+                    SET last_run_at = ?, last_run_result = ?, next_run_at = ?,
+                        running = 0, claimed_at = NULL, claim_token = NULL,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                """, (now, result_str, next_run_at, task_id))
+                """
+                if claim_token is None:
+                    sql += " AND (running = 0 OR running = 1)"
+                else:
+                    sql += " AND running = 1 AND claim_token = ?"
+                    params.append(claim_token)
+                self._execute_sql(cursor, sql, tuple(params))
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
-                logger.error(f"更新任务执行结果失败: {e}")
+                logger.error(f"完成定时任务失败: {e}")
                 self.conn.rollback()
                 return False
+
+    def fail_claimed_task(self, task_id, claim_token, result, next_run_at):
+        """记录已 claim 任务失败结果，并推进下次运行时间"""
+        return self.finish_claimed_task(task_id, claim_token, result, next_run_at)
+
+    def recover_stale_claimed_tasks(self, stale_before):
+        """回收长时间 running 的任务"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    UPDATE scheduled_tasks
+                    SET running = 0, claimed_at = NULL, claim_token = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE running = 1 AND claimed_at IS NOT NULL AND claimed_at <= ?
+                """, (stale_before,))
+                recovered_count = cursor.rowcount
+                self.conn.commit()
+                return recovered_count
+            except Exception as e:
+                logger.error(f"回收过期 running 任务失败: {e}")
+                self.conn.rollback()
+                return 0
+
+    def reset_all_running_scheduled_tasks(self):
+        """启动/关闭时清理遗留 running 状态"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, """
+                    UPDATE scheduled_tasks
+                    SET running = 0, claimed_at = NULL, claim_token = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE running = 1 OR claimed_at IS NOT NULL OR claim_token IS NOT NULL
+                """)
+                reset_count = cursor.rowcount
+                self.conn.commit()
+                return reset_count
+            except Exception as e:
+                logger.error(f"清理遗留 running 状态失败: {e}")
+                self.conn.rollback()
+                return 0
+
+    def update_task_run_result(self, task_id, result, next_run_at):
+        """兼容旧调用，按无 token 完成任务并清理运行状态"""
+        return self.finish_claimed_task(task_id, None, result, next_run_at)
 
 
 # 全局单例

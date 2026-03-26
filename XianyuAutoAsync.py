@@ -798,7 +798,7 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None):
+    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None, register_global: bool = True):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -815,6 +815,7 @@ class XianyuLive:
         self.last_memory_log = 0  # 上次内存日志时间
         self.cookies_str = cookies_str  # 保存原始cookie字符串
         self.user_id = user_id  # 保存用户ID，用于token刷新时保持正确的所有者关系
+        self.register_global = register_global  # 是否注册到全局实例字典
         self.base_url = WEBSOCKET_URL
 
         if 'unb' not in self.cookies:
@@ -963,7 +964,8 @@ class XianyuLive:
         self._init_order_status_handler()
 
         # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        if self.register_global:
+            self._register_instance()
 
     @property
     def message_debounce_delay(self):
@@ -998,9 +1000,15 @@ class XianyuLive:
     def _unregister_instance(self):
         """从类级别字典中注销当前实例"""
         try:
-            if self.cookie_id in XianyuLive._instances:
+            if not self.register_global:
+                return
+
+            current_instance = XianyuLive._instances.get(self.cookie_id)
+            if current_instance is self:
                 del XianyuLive._instances[self.cookie_id]
                 logger.warning(f"【{self.cookie_id}】实例已从全局字典中注销")
+            elif current_instance is not None:
+                logger.info(f"【{self.cookie_id}】全局实例已被其他对象接管，跳过注销")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注销实例失败: {self._safe_str(e)}")
 
