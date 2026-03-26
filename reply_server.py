@@ -3288,6 +3288,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
         # 检查是否已存在相同unb的账号
         existing_cookies = db_manager.get_all_cookies(user_id)
         existing_account_id = None
+        previous_cookie_value = None
 
         for account_id, cookie_value in existing_cookies.items():
             try:
@@ -3295,6 +3296,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                 existing_cookie_dict = trans_cookies(cookie_value)
                 if existing_cookie_dict.get('unb') == unb:
                     existing_account_id = account_id
+                    previous_cookie_value = cookie_value
                     break
             except:
                 continue
@@ -3360,20 +3362,78 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     real_cookies = updated_cookie_info['cookies_str']
                     log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
 
-                    # 第二步：将真实cookie添加到cookie_manager（如果是新账号）或更新现有账号
-                    if cookie_manager.manager:
-                        if is_new_account:
-                            cookie_manager.manager.add_cookie(account_id, real_cookies)
-                            log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
+                    token_prewarmed = False
+                    task_restarted = False
+                    warning_message = None
+                    final_cookies = temp_instance.cookies_str or real_cookies
+
+                    try:
+                        log_with_user('info', f"开始预热扫码登录Token: {account_id}", current_user)
+                        prewarmed_token = await temp_instance.refresh_token()
+                        final_cookies = temp_instance.cookies_str or real_cookies
+
+                        if prewarmed_token:
+                            XianyuLive.cache_qr_prewarmed_token(account_id, prewarmed_token)
+                            token_prewarmed = True
+                            log_with_user('info', f"扫码登录Token预热成功: {account_id}", current_user)
                         else:
-                            # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                            cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
-                            log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                            warning_message = "真实Cookie已获取，但首次Token初始化失败，未切换到新的账号任务"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                    except Exception as token_e:
+                        final_cookies = temp_instance.cookies_str or real_cookies
+                        warning_message = f"真实Cookie已获取，但首次Token初始化异常，未切换到新的账号任务: {str(token_e)}"
+                        log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+
+                    if token_prewarmed:
+                        try:
+                            if cookie_manager.manager:
+                                if is_new_account:
+                                    cookie_manager.manager.add_cookie(account_id, final_cookies, user_id=user_id)
+                                    log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
+                                else:
+                                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
+                                    cookie_manager.manager.update_cookie(account_id, final_cookies, save_to_db=False)
+                                    log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
+                                task_restarted = True
+                            else:
+                                warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                                log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        except Exception as task_switch_e:
+                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                            warning_message = f"真实Cookie和Token已获取，但切换账号任务失败: {str(task_switch_e)}"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+
+                    if not task_restarted:
+                        if token_prewarmed:
+                            XianyuLive.clear_qr_prewarmed_token(account_id)
+                        if not warning_message:
+                            warning_message = "真实Cookie和Token已获取，但任务管理器未初始化，未启动账号任务"
+                            log_with_user('warning', f"{warning_message}: {account_id}", current_user)
+                        if is_new_account:
+                            db_manager.delete_cookie(account_id)
+                            log_with_user('warning', f"扫码登录未完成切换，已删除临时创建的新账号记录: {account_id}", current_user)
+                        elif previous_cookie_value:
+                            db_manager.update_cookie_account_info(account_id, cookie_value=previous_cookie_value)
+                            log_with_user('warning', f"扫码登录未完成切换，已回滚现有账号Cookie: {account_id}", current_user)
+                        else:
+                            log_with_user('warning', f"扫码登录未完成切换，但未找到可回滚的旧Cookie: {account_id}", current_user)
 
                     # 更新风控日志状态
                     if risk_log_id:
                         try:
-                            db_manager.update_risk_control_log(log_id=risk_log_id, processing_status='success', processing_result='扫码登录真实Cookie获取成功')
+                            if token_prewarmed and task_restarted:
+                                db_manager.update_risk_control_log(
+                                    log_id=risk_log_id,
+                                    processing_status='success',
+                                    processing_result='扫码登录真实Cookie获取成功，Token预热完成并已启动账号任务'
+                                )
+                            else:
+                                db_manager.update_risk_control_log(
+                                    log_id=risk_log_id,
+                                    processing_status='failed',
+                                    error_message=(warning_message or 'Token预热失败，未启动账号任务')[:200],
+                                    processing_result='扫码登录真实Cookie获取成功，但未切换到新任务'
+                                )
                         except Exception:
                             pass
 
@@ -3381,7 +3441,10 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                         'account_id': account_id,
                         'is_new_account': is_new_account,
                         'real_cookie_refreshed': True,
-                        'cookie_length': len(real_cookies)
+                        'cookie_length': len(final_cookies),
+                        'token_prewarmed': token_prewarmed,
+                        'task_restarted': task_restarted,
+                        'warning_message': warning_message
                     }
                 else:
                     log_with_user('error', f"无法从数据库获取真实cookie: {account_id}", current_user)
